@@ -1,0 +1,118 @@
+---
+name: game-radar
+description: "贴吧内鬼/爆料雷达：抓取鸣潮/绝区零内鬼吧、关键词预筛、LLM 爆料判定，并汇报最新情报。"
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🎮",
+        "requires": { "bins": ["python3"] }
+      }
+  }
+---
+
+# 游戏雷达 (Game Radar)
+
+贴吧内鬼/爆料吧的抓取、关键词预筛和 LLM 判定工具。数据库在 Windows 侧。
+
+当 Kaelting 问到鸣潮或绝区零的爆料/前瞻/内鬼消息，或要求你拉取最新情报时使用此 skill。
+
+## 能力
+
+1. **拉取最新帖子**（crawl）——抓取贴吧、入库、关键词筛、LLM 判定
+2. **查询已有情报**（query）——查数据库里已判定的爆料
+3. **查看抓取日志**（log）——最近几轮的抓取统计
+
+## 命令
+
+### 拉取最新帖子
+
+```bash
+cd /mnt/c/Users/streamax/Desktop/龙虾学术 && .venv/Scripts/python.exe -m src.main
+```
+
+这会依次执行：抓取 → 快照入库 → 关键词预筛 → LLM 判定。输出示例：
+```
+[鸣潮爆料] seen=11 new=7 posts+=44 err=None
+[鸣潮内鬼] seen=8 new=6 posts+=34 err=None
+[filter] 新标记 signal=7
+[llm] 判定完成 judged=3
+```
+
+### 查询最新爆料（is_leak=1 且高置信度）
+
+```bash
+cd /mnt/c/Users/streamax/Desktop/龙虾学术 && .venv/Scripts/python.exe -c "
+import sys; sys.stdout.reconfigure(encoding='utf-8')
+from src.db import connect; from pathlib import Path
+conn = connect(Path('data/radar.db'))
+for r in conn.execute('''
+    SELECT tid, title, forum_kw, llm_summary, llm_confidence, llm_tags
+    FROM threads WHERE llm_is_leak=1 ORDER BY llm_confidence DESC, first_seen DESC LIMIT 10
+''').fetchall():
+    print(f'[{r[chr(34)+\"forum_kw\"+chr(34)]}] conf={r[chr(34)+\"llm_confidence\"+chr(34)]} {r[chr(34)+\"title\"+chr(34)]}')
+    print(f'  {r[chr(34)+\"llm_summary\"+chr(34)]}')
+    print(f'  tags={r[chr(34)+\"llm_tags\"+chr(34)]}')
+    print()
+"
+```
+
+### 查询特定关键词的帖子
+
+将 `KEYWORD` 替换为实际搜索词（如「清宵」「卡池」「联动」）：
+
+```bash
+cd /mnt/c/Users/streamax/Desktop/龙虾学术 && .venv/Scripts/python.exe -c "
+import sys; sys.stdout.reconfigure(encoding='utf-8')
+from src.db import connect; from pathlib import Path
+conn = connect(Path('data/radar.db'))
+for r in conn.execute(
+    'SELECT t.tid, t.title, p.content, p.author_name FROM posts p JOIN threads t ON t.tid=p.tid WHERE p.content LIKE ? AND p.is_signal=1 ORDER BY p.first_seen DESC LIMIT 5',
+    ('%KEYWORD%',)).fetchall():
+    print(r[0], r[1], '|', r[3])
+    print(' ', (r[2] or '')[:150])
+    print()
+"
+```
+
+### 抓取日志
+
+```bash
+cd /mnt/c/Users/streamax/Desktop/龙虾学术 && .venv/Scripts/python.exe -c "
+import sys; sys.stdout.reconfigure(encoding='utf-8')
+from src.db import connect; from pathlib import Path
+conn = connect(Path('data/radar.db'))
+for r in conn.execute('SELECT * FROM crawl_log ORDER BY id DESC LIMIT 10').fetchall():
+    print(dict(r))
+"
+```
+
+### 数据库统计
+
+```bash
+cd /mnt/c/Users/streamax/Desktop/龙虾学术 && .venv/Scripts/python.exe -c "
+import sys; sys.stdout.reconfigure(encoding='utf-8')
+from src.db import connect; from pathlib import Path
+conn = connect(Path('data/radar.db'))
+for t in ['forums','threads','posts','snapshots','crawl_log']:
+    n = conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+    print(f'{t}: {n}')
+sig = conn.execute('SELECT COUNT(*) FROM posts WHERE is_signal=1').fetchone()[0]
+leak = conn.execute('SELECT COUNT(*) FROM threads WHERE llm_is_leak=1').fetchone()[0]
+print(f'signal posts: {sig}')
+print(f'confirmed leaks: {leak}')
+"
+```
+
+## 注意
+
+- 抓取用 Playwright headless Chromium + 贴吧登录态 cookie，cookie 在 Windows 侧 `cookies/tieba.json`
+- cookie 过期后需要重新导出（参考 cookies/README.md）
+- 高频抓取有封号风险，默认 10 分钟一轮，建议不要缩短间隔
+- 数据库路径：`/mnt/c/Users/streamax/Desktop/龙虾学术/data/radar.db`
+
+## 覆盖吧
+
+- 鸣潮爆料吧
+- 鸣潮内鬼吧
+- （后续可在 config/sources.yaml 中添加更多）
