@@ -4,6 +4,7 @@ from pathlib import Path
 
 import yaml
 
+from . import filter as kw_filter
 from .scraper import run_once
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +29,12 @@ def main() -> None:
 
     while True:
         run_once(forums, crawl_cfg, db_path, cookie_path)
+        # 关键词预筛
+        from .db import connect as db_connect
+        conn = db_connect(db_path)
+        n_signal = kw_filter.run(conn)
+        conn.close()
+        print(f"[filter] 新标记 signal={n_signal}")
         if not args.loop:
             return
         interval = crawl_cfg["loop_interval_seconds"]

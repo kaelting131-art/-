@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS posts (
     content_hash  TEXT NOT NULL,
     posted_at     TEXT,
     first_seen    TEXT NOT NULL,
+    is_signal     INTEGER NOT NULL DEFAULT 0,  -- 1=命中关键词预筛
+    signal_reason TEXT,                         -- 命中的关键词（逗号分隔）
     UNIQUE (tid, floor, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_posts_tid ON posts(tid, floor);
@@ -65,6 +67,17 @@ CREATE TABLE IF NOT EXISTS crawl_log (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(posts)")}
+    if "is_signal" not in cols:
+        conn.execute("ALTER TABLE posts ADD COLUMN is_signal INTEGER NOT NULL DEFAULT 0")
+    if "signal_reason" not in cols:
+        conn.execute("ALTER TABLE posts ADD COLUMN signal_reason TEXT")
+    # 新列加完后才能建索引
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_signal ON posts(is_signal)")
+    conn.commit()
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -72,4 +85,5 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    _migrate(conn)
     return conn
