@@ -78,11 +78,14 @@ def _crawl_forum(ctx: BrowserContext, conn: sqlite3.Connection, forum: dict, cfg
         _upsert_forum(conn, forum)
         thread_tids: list[int] = []
 
-        # 1. 列表页
+        # 1. 列表页（贴吧用虚拟列表，需滚动触发渲染）
         for i in range(cfg["list_pages_per_round"]):
             url = f"https://tieba.baidu.com/f?kw={forum['kw']}&pn={i * 50}"
-            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            _sleep(cfg)
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+            # 滚动到底部触发虚拟列表渲染更多条目
+            for _ in range(cfg.get("scroll_rounds", 5)):
+                page.evaluate("window.scrollBy(0, window.innerHeight)")
+                page.wait_for_timeout(800)
             html = page.content()
             items = parser.parse_list_page(html)
             log["threads_seen"] += len(items)
@@ -98,10 +101,14 @@ def _crawl_forum(ctx: BrowserContext, conn: sqlite3.Connection, forum: dict, cfg
             for pn in range(1, cfg["thread_pages_max"] + 1):
                 url = f"https://tieba.baidu.com/p/{tid}?pn={pn}"
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    page.goto(url, wait_until="networkidle", timeout=30_000)
                 except Exception as e:
                     log["error"] = f"thread {tid} page {pn}: {e}"
                     break
+                # 滚动触发虚拟列表加载更多楼层
+                for _ in range(cfg.get("scroll_rounds", 5)):
+                    page.evaluate("window.scrollBy(0, window.innerHeight)")
+                    page.wait_for_timeout(600)
                 _sleep(cfg)
                 html = page.content()
                 # 帖子被删时，贴吧会跳到"出错啦"页；这种情况快照仍然存（留证），但停止翻页。
