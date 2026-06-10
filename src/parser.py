@@ -27,7 +27,7 @@ def parse_list_page(html: str) -> list[dict]:
     threads: dict[int, dict] = {}
 
     # 策略1：新版 Vue SPA
-    # 以 class="thread-title" 为锚点，往前 5000 字节找最近的 /p/<tid>，往后提取第一个非空 span 文字
+    # 以 class="thread-title" 为锚点，往前 5000 字节找最近的 /p/<tid> 和 head-name
     for m in re.finditer(r'class="thread-title"', html):
         idx = m.start()
         before = html[max(0, idx - 5000):idx]
@@ -37,11 +37,15 @@ def parse_list_page(html: str) -> list[dict]:
         tid = int(tid_matches[-1])
         if tid in threads:
             continue
+        # 标题
         after = html[idx:idx + 600]
         spans = re.findall(r'<span[^>]*>([^<\s][^<]{3,})</span>', after)
         title = unescape(spans[0]).strip() if spans else None
+        # 作者名：取 thread-title 前最后一个 head-name
+        all_names = re.findall(r'class="head-name"[^>]*>\s*([^<]+?)\s*</a>', before)
+        author_name = unescape(all_names[-1]).strip() if all_names else None
         threads[tid] = {"tid": tid, "title": title,
-                        "reply_count": None, "author_name": None, "author_id": None}
+                        "reply_count": None, "author_name": author_name, "author_id": None}
 
     # 策略2：旧版 —— href="/p/<tid>" title="..."
     if not threads:
@@ -91,9 +95,9 @@ def parse_thread_page(html: str) -> list[dict]:
         if not content:
             content = _strip_html(re.sub(r'<style[^>]*>.*?</style>', '', block, flags=re.S))[:500]
 
-        # 楼层号
+        # 楼层号（首楼没有"第N楼"标记，设为 1）
         floor_m = re.search(r'第(\d+)楼', block)
-        floor = int(floor_m.group(1)) if floor_m else None
+        floor = int(floor_m.group(1)) if floor_m else 1
 
         # 日期
         date_m = re.search(r'(\d{2}-\d{2}|\d{4}-\d{2}-\d{2})', block)
