@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from . import filter as kw_filter
+from . import llm
 from .scraper import run_once
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,8 +34,11 @@ def main() -> None:
         from .db import connect as db_connect
         conn = db_connect(db_path)
         n_signal = kw_filter.run(conn)
-        conn.close()
         print(f"[filter] 新标记 signal={n_signal}")
+        # LLM 判定（通过 openclaw）
+        n_judged = llm.run(conn, db_path)
+        conn.close()
+        print(f"[llm] 判定完成 judged={n_judged}")
         if not args.loop:
             return
         interval = crawl_cfg["loop_interval_seconds"]
