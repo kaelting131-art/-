@@ -20,8 +20,9 @@ def _sleep(cfg: dict) -> None:
 
 def _upsert_forum(conn: sqlite3.Connection, forum: dict) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO forums(kw, name, game, first_seen) VALUES (?, ?, ?, ?)",
-        (forum["kw"], forum["name"], forum["game"], _now()),
+        "INSERT INTO forums(kw, name, game, topic, first_seen) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(kw) DO UPDATE SET name=excluded.name, topic=excluded.topic",
+        (forum["kw"], forum["name"], forum["game"], forum.get("topic", "leak"), _now()),
     )
 
 

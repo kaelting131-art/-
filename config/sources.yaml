@@ -1,12 +1,19 @@
-# 信源清单。v0 只跑两个，后面继续加。
+# 信源清单。topic: leak=爆料/内鬼，strength=强度分析（预筛词和 LLM 判定逻辑不同）
 forums:
   - name: 鸣潮爆料
     kw: 鸣潮爆料            # 贴吧 URL ?kw= 后的值
     game: 鸣潮
+    topic: leak
     enabled: true
   - name: 鸣潮内鬼
     kw: 鸣潮内鬼
     game: 鸣潮
+    topic: leak
+    enabled: true
+  - name: 鸣潮强度
+    kw: 鸣潮强度
+    game: 鸣潮
+    topic: strength
     enabled: true
 
 crawl:

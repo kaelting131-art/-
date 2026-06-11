@@ -11,7 +11,7 @@ OPENCLAW_BIN = "/home/streamax/.npm-global/bin/openclaw"
 AGENT_ID = "main"
 TIMEOUT_SEC = 120
 
-JUDGE_PROMPT_TMPL = """你是游戏爆料情报分析员，专注鸣潮和绝区零。
+LEAK_PROMPT_TMPL = """你是游戏爆料情报分析员，专注鸣潮和绝区零。
 下面是贴吧内鬼/爆料吧里的一个帖子（含楼层），请判断：
 
 1. is_leak（bool）：这是不是真实的游戏内容爆料/前瞻（非官方公布内容）？
@@ -28,6 +28,30 @@ JUDGE_PROMPT_TMPL = """你是游戏爆料情报分析员，专注鸣潮和绝区
 
 直接输出 JSON，不要任何前后缀，格式：
 {{"is_leak": bool, "is_bait": bool, "confidence": 0-10, "summary": "...", "tags": [...]}}"""
+
+# 强度吧：is_leak 字段在这里的语义是"有信息量的强度分析"，复用同一套 DB 字段
+STRENGTH_PROMPT_TMPL = """你是游戏强度分析情报员，专注鸣潮和绝区零。
+下面是贴吧强度吧里的一个帖子（含楼层），请判断：
+
+1. is_leak（bool）：这是不是有信息量的强度分析/配队推荐/抽卡建议（有具体结论或数据支撑，而非纯水贴）？
+2. is_bait（bool）：是否是引战/钓鱼/无意义水贴？
+3. confidence（0-10）：你对判断的置信度。
+4. summary（中文，1-2句）：概括核心结论（如"XX角色T0，建议必抽"、"XX配队深塔伤害超标"）；没有有效结论就写"无有效结论"。
+5. tags（数组）：内容标签，从["强度","配队","抽卡建议","数值","角色","武器","深塔"]中选0-3个。
+
+【帖子信息】
+吧名：{forum}
+标题：{title}
+楼层内容：
+{content}
+
+直接输出 JSON，不要任何前后缀，格式：
+{{"is_leak": bool, "is_bait": bool, "confidence": 0-10, "summary": "...", "tags": [...]}}"""
+
+PROMPT_BY_TOPIC = {
+    "leak": LEAK_PROMPT_TMPL,
+    "strength": STRENGTH_PROMPT_TMPL,
+}
 
 
 def _call_openclaw(prompt: str) -> str:
@@ -65,8 +89,9 @@ def _extract_json(text: str) -> dict:
     return json.loads(s[start:end + 1])
 
 
-def judge_thread(forum: str, title: str, posts: list[dict]) -> dict:
-    """对一个帖子（含多楼层）做综合判定，返回 {is_leak, is_bait, confidence, summary, tags}。"""
+def judge_thread(forum: str, title: str, posts: list[dict], topic: str = "leak") -> dict:
+    """对一个帖子（含多楼层）做综合判定，返回 {is_leak, is_bait, confidence, summary, tags}。
+    topic 决定用哪套提示词：leak=爆料判定，strength=强度分析判定。"""
     content_lines = []
     for p in posts[:10]:  # 最多取前 10 楼，控制 token
         floor = p.get("floor") or "?"
@@ -74,7 +99,8 @@ def judge_thread(forum: str, title: str, posts: list[dict]) -> dict:
         text = (p.get("content") or "").strip()[:300]
         content_lines.append(f"第{floor}楼 [{author}]: {text}")
     content = "\n".join(content_lines)
-    prompt = JUDGE_PROMPT_TMPL.format(forum=forum, title=title or "(无标题)", content=content)
+    tmpl = PROMPT_BY_TOPIC.get(topic, LEAK_PROMPT_TMPL)
+    prompt = tmpl.format(forum=forum, title=title or "(无标题)", content=content)
     raw = _call_openclaw(prompt)
     return _extract_json(raw)
 
@@ -86,7 +112,8 @@ def run(conn: sqlite3.Connection, db_path: Path) -> int:
 
     rows = conn.execute("""
         SELECT DISTINCT t.tid, t.title, t.forum_kw,
-               f.name as forum_name
+               f.name as forum_name,
+               COALESCE(f.topic, 'leak') as topic
         FROM posts p
         JOIN threads t ON t.tid = p.tid
         JOIN forums f ON f.kw = t.forum_kw
@@ -101,7 +128,8 @@ def run(conn: sqlite3.Connection, db_path: Path) -> int:
             (row["tid"],)
         ).fetchall()
         try:
-            result = judge_thread(row["forum_name"], row["title"], [dict(p) for p in posts])
+            result = judge_thread(row["forum_name"], row["title"], [dict(p) for p in posts],
+                                  topic=row["topic"])
             conn.execute("""
                 UPDATE threads SET
                     llm_judged = 1,

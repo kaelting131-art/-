@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS forums (
     kw          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     game        TEXT NOT NULL,
+    topic       TEXT NOT NULL DEFAULT 'leak',  -- leak=爆料/内鬼，strength=强度分析
     first_seen  TEXT NOT NULL
 );
 
@@ -75,6 +76,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE posts ADD COLUMN signal_reason TEXT")
     # 新列加完后才能建索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_signal ON posts(is_signal)")
+    fcols = {r[1] for r in conn.execute("PRAGMA table_info(forums)")}
+    if "topic" not in fcols:
+        conn.execute("ALTER TABLE forums ADD COLUMN topic TEXT NOT NULL DEFAULT 'leak'")
     conn.commit()
 
 

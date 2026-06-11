@@ -1,6 +1,6 @@
 ---
 name: game-radar
-description: "贴吧内鬼/爆料雷达：抓取鸣潮/绝区零内鬼吧、关键词预筛、LLM 爆料判定，并汇报最新情报。"
+description: "贴吧内鬼/爆料/强度雷达：抓取鸣潮/绝区零内鬼吧和强度吧、关键词预筛、LLM 判定（爆料真伪/强度分析），并汇报最新情报。"
 metadata:
   {
     "openclaw":
@@ -13,15 +13,16 @@ metadata:
 
 # 游戏雷达 (Game Radar)
 
-贴吧内鬼/爆料吧的抓取、关键词预筛和 LLM 判定工具。数据库在 Windows 侧。
+贴吧内鬼/爆料吧和强度吧的抓取、关键词预筛和 LLM 判定工具。数据库在 Windows 侧。
 
-当 Kaelting 问到鸣潮或绝区零的爆料/前瞻/内鬼消息，或要求你拉取最新情报时使用此 skill。
+当 Kaelting 问到鸣潮或绝区零的爆料/前瞻/内鬼消息、角色强度/配队/抽卡建议，或要求你拉取最新情报时使用此 skill。
 
 ## 能力
 
 1. **拉取最新帖子**（crawl）——抓取贴吧、入库、关键词筛、LLM 判定
 2. **查询已有情报**（query）——查数据库里已判定的爆料
-3. **查看抓取日志**（log）——最近几轮的抓取统计
+3. **查询强度分析**（strength）——强度吧里有价值的强度/配队/抽卡结论
+4. **查看抓取日志**（log）——最近几轮的抓取统计
 
 ## 命令
 
@@ -35,6 +36,7 @@ cd /mnt/c/Users/streamax/Desktop/龙虾学术 && .venv/Scripts/python.exe -m src
 ```
 [鸣潮爆料] seen=11 new=7 posts+=44 err=None
 [鸣潮内鬼] seen=8 new=6 posts+=34 err=None
+[鸣潮强度] seen=10 new=8 posts+=50 err=None
 [filter] 新标记 signal=7
 [llm] 判定完成 judged=3
 ```
@@ -51,6 +53,28 @@ for r in conn.execute('''
     FROM threads WHERE llm_is_leak=1 ORDER BY llm_confidence DESC, first_seen DESC LIMIT 10
 ''').fetchall():
     print(f'[{r[chr(34)+\"forum_kw\"+chr(34)]}] conf={r[chr(34)+\"llm_confidence\"+chr(34)]} {r[chr(34)+\"title\"+chr(34)]}')
+    print(f'  {r[chr(34)+\"llm_summary\"+chr(34)]}')
+    print(f'  tags={r[chr(34)+\"llm_tags\"+chr(34)]}')
+    print()
+"
+```
+
+### 查询强度分析（强度吧里有价值的结论）
+
+强度吧的 `llm_is_leak=1` 表示「有信息量的强度分析」，summary 是核心结论：
+
+```bash
+cd /mnt/c/Users/streamax/Desktop/龙虾学术 && .venv/Scripts/python.exe -c "
+import sys; sys.stdout.reconfigure(encoding='utf-8')
+from src.db import connect; from pathlib import Path
+conn = connect(Path('data/radar.db'))
+for r in conn.execute('''
+    SELECT t.tid, t.title, t.llm_summary, t.llm_confidence, t.llm_tags
+    FROM threads t JOIN forums f ON f.kw = t.forum_kw
+    WHERE f.topic='strength' AND t.llm_is_leak=1
+    ORDER BY t.llm_confidence DESC, t.first_seen DESC LIMIT 10
+''').fetchall():
+    print(f'conf={r[chr(34)+\"llm_confidence\"+chr(34)]} {r[chr(34)+\"title\"+chr(34)]}')
     print(f'  {r[chr(34)+\"llm_summary\"+chr(34)]}')
     print(f'  tags={r[chr(34)+\"llm_tags\"+chr(34)]}')
     print()
@@ -113,6 +137,7 @@ print(f'confirmed leaks: {leak}')
 
 ## 覆盖吧
 
-- 鸣潮爆料吧
-- 鸣潮内鬼吧
+- 鸣潮爆料吧（topic=leak，爆料真伪判定）
+- 鸣潮内鬼吧（topic=leak，爆料真伪判定）
+- 鸣潮强度吧（topic=strength，强度/配队/抽卡分析判定）
 - （后续可在 config/sources.yaml 中添加更多）
