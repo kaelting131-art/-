@@ -159,6 +159,7 @@ INDEX_TEMPLATE = """<!doctype html>
   <div class="chip"><b>{{ stats.leaks }}</b><span>确认爆料</span></div>
   <div class="chip"><b>{{ stats.strength }}</b><span>强度结论</span></div>
   <div class="chip"><b>{{ stats.pending }}</b><span>待判定</span></div>
+  <div class="chip"><b>{{ stats.flash_only }}</b><span>flash筛掉</span></div>
   <div class="chip"><b>{{ stats.deleted }}</b><span>已删帖</span></div>
   <div class="chip"><b>{{ stats.last_crawl }}</b><span>最近抓取</span></div>
 </div>
@@ -304,12 +305,13 @@ THREAD_TEMPLATE = """<!doctype html>
   {% endif %}
 </div>
 
-<h2>💬 楼层（{{ posts|length }} 条，⭐=预筛命中）</h2>
+<h2>💬 楼层（{{ posts|length }} 条 · 👑=楼主 · ⭐=预筛命中 · LLM 只判楼主楼层）</h2>
 {% for p in posts %}
-<div class="floor {{ 'sig' if p.is_signal }}">
+<div class="floor {{ 'sig' if p.is_op }}">
   <div class="who">
     {{ p.floor }}楼 · {{ p.author_name or '匿名' }} · {{ p.time }}
-    {% if p.is_signal %}<span class="badge sig">⭐ {{ p.signal_reason }}</span>{% endif %}
+    {% if p.is_op %}<span class="badge sig">👑 楼主</span>{% endif %}
+    {% if p.is_signal %}<span class="badge tag">⭐ {{ p.signal_reason }}</span>{% endif %}
   </div>
   <div class="txt">{{ p.content or '(空)' }}</div>
 </div>
@@ -456,6 +458,8 @@ def index():
             "pending": conn.execute(
                 "SELECT COUNT(DISTINCT t.tid) FROM posts p JOIN threads t ON t.tid=p.tid "
                 "WHERE p.is_signal=1 AND (t.llm_judged IS NULL OR t.llm_judged=0)").fetchone()[0],
+            "flash_only": conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE llm_model='flash'").fetchone()[0],
             "deleted": conn.execute(
                 "SELECT COUNT(*) FROM threads WHERE deleted_at IS NOT NULL").fetchone()[0],
             "last_crawl": _fmt_time(conn.execute(
@@ -486,7 +490,7 @@ def thread_detail(tid: int):
         posts = [
             {**dict(p), "time": _fmt_time(p["first_seen"])}
             for p in conn.execute(
-                "SELECT floor, author_name, content, is_signal, signal_reason, first_seen "
+                "SELECT floor, author_name, content, is_signal, signal_reason, is_op, first_seen "
                 "FROM posts WHERE tid=? ORDER BY floor, id", (tid,)).fetchall()
         ]
         n_snapshots = conn.execute(

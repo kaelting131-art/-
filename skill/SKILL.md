@@ -128,12 +128,22 @@ print(f'confirmed leaks: {leak}')
 "
 ```
 
+## 判定模型（智能路由）
+
+LLM 判定走两阶段，省钱省时间：
+- **flash**（`deepseek-v4-flash`）跑全量分类：is_leak / is_bait / confidence / tags
+- **pro**（`deepseek-v4-pro`）只对有价值的帖（is_leak=1）生成高质量中文 summary
+
+大部分水贴/非爆料只花一次 flash 调用；threads.llm_model 记录每帖实际用的模型（flash / flash+pro）。
+判定只看楼主（主楼 + 楼主补充楼），回复区噪音不喂给 LLM。
+
 ## 注意
 
 - 抓取用 Playwright headless Chromium + 贴吧登录态 cookie，cookie 在 Windows 侧 `cookies/tieba.json`
 - cookie 过期后需要重新导出（参考 cookies/README.md）
 - 高频抓取有封号风险，默认 10 分钟一轮，建议不要缩短间隔
 - 数据库路径：`/mnt/c/Users/streamax/Desktop/龙虾学术/data/radar.db`
+- 解析器迭代后可从快照重建数据：`python reparse.py`（不用重爬），再 `python repipe.py` 重筛重判
 
 ## 覆盖吧
 
