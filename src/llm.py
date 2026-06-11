@@ -125,6 +125,7 @@ def run(conn: sqlite3.Connection, db_path: Path) -> int:
         JOIN forums f ON f.kw = t.forum_kw
         WHERE p.is_signal = 1
           AND (t.llm_judged IS NULL OR t.llm_judged = 0)
+          AND COALESCE(t.llm_attempts, 0) < 3
     """).fetchall()
 
     judged = 0
@@ -158,6 +159,11 @@ def run(conn: sqlite3.Connection, db_path: Path) -> int:
             print(f"  [llm] tid={row['tid']} leak={result.get('is_leak')} "
                   f"conf={result.get('confidence')} {result.get('summary', '')[:40]}")
         except Exception as e:
+            conn.execute(
+                "UPDATE threads SET llm_attempts = COALESCE(llm_attempts, 0) + 1 WHERE tid = ?",
+                (row["tid"],),
+            )
+            conn.commit()
             print(f"  [llm] tid={row['tid']} 判定失败: {e}")
     return judged
 
@@ -171,6 +177,7 @@ def _ensure_llm_cols(conn: sqlite3.Connection) -> None:
         ("llm_confidence", "INTEGER"),
         ("llm_summary",    "TEXT"),
         ("llm_tags",       "TEXT"),
+        ("llm_attempts",   "INTEGER NOT NULL DEFAULT 0"),  # 判定失败重试计数，3 次后放弃
     ]
     for col, typedef in additions:
         if col not in cols:

@@ -1,4 +1,5 @@
 import sqlite3
+import zlib
 from pathlib import Path
 
 SCHEMA = """
@@ -79,7 +80,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     fcols = {r[1] for r in conn.execute("PRAGMA table_info(forums)")}
     if "topic" not in fcols:
         conn.execute("ALTER TABLE forums ADD COLUMN topic TEXT NOT NULL DEFAULT 'leak'")
+    scols = {r[1] for r in conn.execute("PRAGMA table_info(snapshots)")}
+    if "content_hash" not in scols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN content_hash TEXT")
+    if "raw_gz" not in scols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN raw_gz BLOB")
     conn.commit()
+
+
+def snapshot_html(row) -> str:
+    """从快照行还原 HTML。新行存 zlib 压缩的 raw_gz，旧行存明文 raw_html。"""
+    if row["raw_gz"] is not None:
+        return zlib.decompress(row["raw_gz"]).decode("utf-8", "replace")
+    return row["raw_html"]
 
 
 def connect(db_path: Path) -> sqlite3.Connection:

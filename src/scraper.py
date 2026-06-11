@@ -1,6 +1,8 @@
+import hashlib
 import random
 import sqlite3
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -48,9 +50,19 @@ def _upsert_thread(conn: sqlite3.Connection, forum_kw: str, t: dict) -> bool:
 
 
 def _save_snapshot(conn: sqlite3.Connection, tid: int, page: int, html: str) -> None:
+    """快照存 zlib 压缩（贴吧页 ~800KB 压后 ~80KB）；与上一份同页快照内容相同则跳过。"""
+    data = html.encode("utf-8", "replace")
+    h = hashlib.sha256(data).hexdigest()
+    last = conn.execute(
+        "SELECT content_hash FROM snapshots WHERE tid=? AND page=? ORDER BY id DESC LIMIT 1",
+        (tid, page),
+    ).fetchone()
+    if last and last["content_hash"] == h:
+        return
     conn.execute(
-        "INSERT INTO snapshots(tid, page, captured_at, raw_html) VALUES (?, ?, ?, ?)",
-        (tid, page, _now(), html),
+        "INSERT INTO snapshots(tid, page, captured_at, raw_html, raw_gz, content_hash) "
+        "VALUES (?, ?, ?, '', ?, ?)",
+        (tid, page, _now(), zlib.compress(data, 6), h),
     )
 
 
@@ -78,6 +90,7 @@ def _crawl_forum(ctx: BrowserContext, conn: sqlite3.Connection, forum: dict, cfg
     try:
         _upsert_forum(conn, forum)
         thread_tids: list[int] = []
+        new_tids: set[int] = set()
 
         # 1. 列表页（贴吧用虚拟列表，需滚动触发渲染）
         for i in range(cfg["list_pages_per_round"]):
@@ -94,11 +107,23 @@ def _crawl_forum(ctx: BrowserContext, conn: sqlite3.Connection, forum: dict, cfg
                 is_new = _upsert_thread(conn, forum["kw"], t)
                 if is_new:
                     log["threads_new"] += 1
+                    new_tids.add(t["tid"])
                 thread_tids.append(t["tid"])
             conn.commit()
 
-        # 2. 详情页（仅新发现 + 最近一轮没抓过详情的，简化为：所有列表里看到的）
-        for tid in thread_tids:
+        # 2. 详情页：新帖必抓；老帖在 detail_recheck_hours 内抓过详情则跳过
+        #   （置顶帖会在多个列表页重复出现，dict.fromkeys 去重保序）
+        recheck_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=cfg.get("detail_recheck_hours", 6))
+        ).isoformat()
+        for tid in dict.fromkeys(thread_tids):
+            if tid not in new_tids:
+                last_snap = conn.execute(
+                    "SELECT MAX(captured_at) FROM snapshots WHERE tid=?", (tid,)
+                ).fetchone()[0]
+                if last_snap and last_snap > recheck_cutoff:
+                    continue
             for pn in range(1, cfg["thread_pages_max"] + 1):
                 url = f"https://tieba.baidu.com/p/{tid}?pn={pn}"
                 try:
@@ -135,12 +160,15 @@ def _crawl_forum(ctx: BrowserContext, conn: sqlite3.Connection, forum: dict, cfg
     return log
 
 
-def _detect_deletions(ctx: BrowserContext, conn: sqlite3.Connection, cfg: dict) -> int:
-    """对最近 N 小时内见过、但本轮没再被列表页见到的帖子，逐个探活。"""
+def _detect_deletions(ctx: BrowserContext, conn: sqlite3.Connection, cfg: dict,
+                      round_start: str) -> int:
+    """对最近 N 小时内活跃、但本轮没再被列表页见到的帖子，逐个探活（每轮最多 20 个）。"""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=cfg["recheck_window_hours"])).isoformat()
     rows = conn.execute(
-        "SELECT tid FROM threads WHERE deleted_at IS NULL AND last_seen < ? AND first_seen > ?",
-        (cutoff, cutoff),
+        "SELECT tid FROM threads WHERE deleted_at IS NULL "
+        "AND last_seen >= ? AND last_seen < ? "
+        "ORDER BY last_seen DESC LIMIT 20",
+        (cutoff, round_start),
     ).fetchall()
     if not rows:
         return 0
@@ -169,6 +197,7 @@ def run_once(forums: list[dict], cfg: dict, db_path: Path, cookie_path: Path) ->
     from .db import connect
     conn = connect(db_path)
     cookies = load_cookies(cookie_path)
+    round_start = _now()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(
@@ -199,7 +228,7 @@ def run_once(forums: list[dict], cfg: dict, db_path: Path, cookie_path: Path) ->
                 conn.commit()
                 print(f"[{forum['name']}] seen={log['threads_seen']} new={log['threads_new']} "
                       f"posts+={log['posts_new']} err={log['error']}")
-            n_del = _detect_deletions(ctx, conn, cfg)
+            n_del = _detect_deletions(ctx, conn, cfg, round_start)
             if n_del:
                 print(f"[deletions] marked {n_del} thread(s) as deleted")
         finally:

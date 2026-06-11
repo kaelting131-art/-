@@ -36,6 +36,7 @@ crawl:
   thread_pages_max: 3         # 单帖最多抓前 N 页楼层（防止超长帖拖垮一轮）
   loop_interval_seconds: 600  # --loop 模式每轮间隔
   recheck_window_hours: 48    # 删帖检测：只对最近 N 小时内见过的帖子做存活检查
+  detail_recheck_hours: 6     # 老帖详情页重抓间隔：N 小时内抓过就跳过（新帖总是抓）
   scroll_rounds: 5            # 列表页滚动几轮触发虚拟列表加载（每轮 0.8s）
   min_delay_seconds: 1.5      # 每次页面跳转最小间隔，防风控
   max_delay_seconds: 3.5
