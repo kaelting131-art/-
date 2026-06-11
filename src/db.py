@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS posts (
     first_seen    TEXT NOT NULL,
     is_signal     INTEGER NOT NULL DEFAULT 0,  -- 1=命中关键词预筛
     signal_reason TEXT,                         -- 命中的关键词（逗号分隔）
+    is_op         INTEGER NOT NULL DEFAULT 0,   -- 1=楼主本人的楼层
     UNIQUE (tid, floor, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_posts_tid ON posts(tid, floor);
@@ -75,6 +76,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE posts ADD COLUMN is_signal INTEGER NOT NULL DEFAULT 0")
     if "signal_reason" not in cols:
         conn.execute("ALTER TABLE posts ADD COLUMN signal_reason TEXT")
+    if "is_op" not in cols:
+        conn.execute("ALTER TABLE posts ADD COLUMN is_op INTEGER NOT NULL DEFAULT 0")
     # 新列加完后才能建索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_signal ON posts(is_signal)")
     fcols = {r[1] for r in conn.execute("PRAGMA table_info(forums)")}

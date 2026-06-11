@@ -74,9 +74,10 @@ def _insert_posts(conn: sqlite3.Connection, tid: int, posts: list[dict]) -> int:
         try:
             conn.execute(
                 "INSERT INTO posts(tid, floor, author_name, author_id, content, "
-                "content_hash, posted_at, first_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "content_hash, posted_at, first_seen, is_op) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (tid, p["floor"], p.get("author_name"), p.get("author_id"),
-                 p.get("content"), p["content_hash"], p.get("posted_at"), _now()),
+                 p.get("content"), p["content_hash"], p.get("posted_at"), _now(),
+                 p.get("is_op", 0)),
             )
             n += 1
         except sqlite3.IntegrityError:
