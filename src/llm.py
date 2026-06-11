@@ -2,6 +2,7 @@
 调用方式：openclaw agent --agent main --json --message "<prompt>"
 返回 JSON，回复文本在 result.meta.finalAssistantVisibleText。
 """
+import base64
 import json
 import sqlite3
 import subprocess
@@ -57,14 +58,17 @@ PROMPT_BY_TOPIC = {
 
 
 def _call_openclaw(prompt: str) -> str:
-    """调用 WSL 里的 openclaw，返回 assistant 回复文本。"""
+    """调用 WSL 里的 openclaw，返回 assistant 回复文本。
+    wsl.exe -- 后的参数会被 bash 重新解析，帖子正文里的反引号/引号会炸掉命令行，
+    所以 prompt 走 base64（纯 ASCII 安全字符），bash 侧解码还原。"""
+    b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
     result = subprocess.run(
         [WSL_EXE, "-d", "Ubuntu", "--",
          OPENCLAW_BIN, "agent",
          "--agent", AGENT_ID,
          "--json",
          "--timeout", str(TIMEOUT_SEC),
-         "--message", prompt],
+         "--message", f'"$(echo {b64} | base64 -d)"'],
         capture_output=True, text=True, timeout=TIMEOUT_SEC + 30,
         encoding="utf-8",
     )
