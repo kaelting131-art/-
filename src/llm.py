@@ -10,6 +10,8 @@ from pathlib import Path
 OPENCLAW_BIN = "/home/streamax/.npm-global/bin/openclaw"
 AGENT_ID = "main"
 TIMEOUT_SEC = 120
+# 绝对路径：当管线被 openclaw cron 从 WSL 侧拉起时，子进程 PATH 里没有 System32
+WSL_EXE = r"C:\Windows\System32\wsl.exe"
 
 LEAK_PROMPT_TMPL = """你是游戏爆料情报分析员，专注鸣潮和绝区零。
 下面是贴吧内鬼/爆料吧里的一个帖子（含楼层），请判断：
@@ -57,7 +59,7 @@ PROMPT_BY_TOPIC = {
 def _call_openclaw(prompt: str) -> str:
     """调用 WSL 里的 openclaw，返回 assistant 回复文本。"""
     result = subprocess.run(
-        ["wsl", "-d", "Ubuntu", "--",
+        [WSL_EXE, "-d", "Ubuntu", "--",
          OPENCLAW_BIN, "agent",
          "--agent", AGENT_ID,
          "--json",

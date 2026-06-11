@@ -15,6 +15,21 @@ forums:
     game: 鸣潮
     topic: strength
     enabled: true
+  - name: 绝区零内鬼
+    kw: 绝区零内鬼
+    game: 绝区零
+    topic: leak
+    enabled: true
+  - name: 绝区零爆料
+    kw: 绝区零爆料
+    game: 绝区零
+    topic: leak
+    enabled: true
+  - name: 绝区零强度
+    kw: 绝区零强度
+    game: 绝区零
+    topic: strength
+    enabled: true
 
 crawl:
   list_pages_per_round: 2     # 每个吧每轮抓前 N 页列表

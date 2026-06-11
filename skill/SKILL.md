@@ -137,7 +137,17 @@ print(f'confirmed leaks: {leak}')
 
 ## 覆盖吧
 
-- 鸣潮爆料吧（topic=leak，爆料真伪判定）
-- 鸣潮内鬼吧（topic=leak，爆料真伪判定）
+- 鸣潮爆料吧 / 鸣潮内鬼吧（topic=leak，爆料真伪判定）
 - 鸣潮强度吧（topic=strength，强度/配队/抽卡分析判定）
+- 绝区零内鬼吧 / 绝区零爆料吧（topic=leak）
+- 绝区零强度吧（topic=strength）
 - （后续可在 config/sources.yaml 中添加更多）
+
+## Web 仪表盘
+
+Windows 侧运行 `python -m src.web` 后访问 http://127.0.0.1:8787 ，可视化查看爆料/强度/删帖/抓取日志。
+
+## 定时自主抓取
+
+openclaw cron 任务「游戏雷达自动抓取」每 3 小时（北京时间 8-23 点）自动跑一轮管线。
+查看：`openclaw cron list`；手动触发：`openclaw cron run <id>`。
