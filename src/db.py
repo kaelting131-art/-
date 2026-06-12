@@ -80,6 +80,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE posts ADD COLUMN is_op INTEGER NOT NULL DEFAULT 0")
     # 新列加完后才能建索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_signal ON posts(is_signal)")
+    tcols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
+    if "read_at" not in tcols:
+        conn.execute("ALTER TABLE threads ADD COLUMN read_at TEXT")  # 仪表盘已读标记
     fcols = {r[1] for r in conn.execute("PRAGMA table_info(forums)")}
     if "topic" not in fcols:
         conn.execute("ALTER TABLE forums ADD COLUMN topic TEXT NOT NULL DEFAULT 'leak'")

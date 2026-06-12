@@ -3,6 +3,9 @@
 """
 import json
 import sqlite3
+import subprocess
+import sys
+import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +24,29 @@ def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_read_col() -> None:
+    """老库补 read_at 列（已读标记）。"""
+    conn = _conn()
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
+        if "read_at" not in cols:
+            conn.execute("ALTER TABLE threads ADD COLUMN read_at TEXT")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+_ensure_read_col()
+
+# 「立即抓取」按钮触发的管线子进程（同一时间只允许一个在跑）
+_crawl_lock = threading.Lock()
+_crawl_proc: subprocess.Popen | None = None
 
 
 def _fmt_time(iso: str | None) -> str:
@@ -50,6 +76,7 @@ def _rows_to_items(rows) -> list[dict]:
         d["tags"] = _parse_tags(d.get("llm_tags"))
         d["time"] = _fmt_time(d.get("first_seen"))
         d["deleted"] = bool(d.get("deleted_at"))
+        d["read"] = bool(d.get("read_at"))
         items.append(d)
     return items
 
@@ -129,6 +156,20 @@ BASE_CSS = """
   .floor.sig { border-left-color: var(--accent); }
   .floor .who { color: var(--dim); font-size: 12px; margin-bottom: 2px; }
   .floor .txt { white-space: pre-wrap; word-break: break-word; }
+  /* 工具栏 / 已读 / 智能推荐 */
+  .toolbar { display: flex; align-items: center; gap: 12px; margin: 12px 0 4px; flex-wrap: wrap; }
+  .toolbar button { background: var(--accent); color: #1a1505; border: none; border-radius: 8px;
+                    padding: 7px 16px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  .toolbar button:disabled { opacity: .55; cursor: wait; }
+  .toolbar .hint { color: var(--dim); font-size: 12px; }
+  a.mini, button.rd { font-size: 12px; font-weight: normal; color: var(--dim); background: none;
+                      border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px;
+                      cursor: pointer; text-decoration: none; }
+  a.mini:hover, button.rd:hover { color: var(--accent); border-color: var(--accent); }
+  button.rd { margin-left: auto; flex-shrink: 0; }
+  .card.readed { opacity: .4; }
+  .card.focus { border-color: #6a5524; background: #1d1a13; }
+  .score { color: var(--accent); font-size: 12px; font-weight: 700; }
 """
 
 HEADER = """
@@ -158,6 +199,7 @@ INDEX_TEMPLATE = """<!doctype html>
   <div class="chip"><b>{{ stats.signals }}</b><span>预筛命中</span></div>
   <div class="chip"><b>{{ stats.leaks }}</b><span>确认爆料</span></div>
   <div class="chip"><b>{{ stats.strength }}</b><span>强度结论</span></div>
+  <div class="chip"><b>{{ stats.unread }}</b><span>未读情报</span></div>
   <div class="chip"><b>{{ stats.pending }}</b><span>待判定</span></div>
   <div class="chip"><b>{{ stats.flash_only }}</b><span>flash筛掉</span></div>
   <div class="chip"><b>{{ stats.deleted }}</b><span>已删帖</span></div>
@@ -166,9 +208,35 @@ INDEX_TEMPLATE = """<!doctype html>
 
 <div class="filters">
   {% for g in games %}
-  <a href="?game={{ g }}" class="{{ 'on' if g == game else '' }}">{{ '全部' if g == 'all' else g }}</a>
+  <a href="?game={{ g }}&show={{ show }}" class="{{ 'on' if g == game else '' }}">{{ '全部' if g == 'all' else g }}</a>
   {% endfor %}
 </div>
+
+<div class="toolbar">
+  <button id="crawlbtn" onclick="startCrawl()">🔄 立即抓取</button>
+  <span class="hint">手动触发一轮：抓取 → 预筛 → LLM 判定（约 5-10 分钟），完成后自动刷新</span>
+</div>
+
+<h2>🔥 智能推荐（未读 · 置信度 + 新鲜度 + 删帖加权）</h2>
+{% for it in focus %}
+<div class="card focus">
+  <div class="head">
+    <span class="score">{{ it.score }}分</span>
+    <span class="badge forum">{{ '🕵️' if it.topic == 'leak' else '⚔️' }} {{ it.forum_kw }}</span>
+    <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
+    <a class="ext" href="https://tieba.baidu.com/p/{{ it.tid }}" target="_blank">贴吧↗</a>
+    <span class="badge conf">conf {{ it.llm_confidence }}</span>
+    {% if it.fresh %}<span class="badge sig">🆕 24h</span>{% endif %}
+    {% if it.deleted %}<span class="badge del">已删 ⚠️</span>{% endif %}
+    {% for t in it.tags %}<span class="badge tag">{{ t }}</span>{% endfor %}
+    <button class="rd" onclick="markRead({{ it.tid }}, this)">✓ 已读</button>
+  </div>
+  <div class="summary">{{ it.llm_summary }}</div>
+  <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}</div>
+</div>
+{% else %}
+<div class="empty">未读情报全部看完了 ✨（点「立即抓取」拉一轮新的）</div>
+{% endfor %}
 
 <h2>📈 近 14 天动态</h2>
 <div class="trend">
@@ -204,9 +272,12 @@ INDEX_TEMPLATE = """<!doctype html>
 </table>
 {% endif %}
 
-<h2>🕵️ 爆料情报（置信度排序）</h2>
+<h2>🕵️ 爆料情报（{{ '未读' if show == 'unread' else '全部' }} · 置信度排序）
+  <a class="mini" href="?game={{ game }}&show={{ 'all' if show == 'unread' else 'unread' }}">{{ '显示已读' if show == 'unread' else '只看未读' }}</a>
+  <a class="mini" href="#" onclick="return markAll('leak')">本区全部已读</a>
+</h2>
 {% for it in leaks %}
-<div class="card">
+<div class="card {{ 'readed' if it.read }}">
   <div class="head">
     <span class="badge forum">{{ it.forum_kw }}</span>
     <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
@@ -214,17 +285,21 @@ INDEX_TEMPLATE = """<!doctype html>
     <span class="badge conf">conf {{ it.llm_confidence }}</span>
     {% if it.deleted %}<span class="badge del">已删 ⚠️</span>{% endif %}
     {% for t in it.tags %}<span class="badge tag">{{ t }}</span>{% endfor %}
+    {% if not it.read %}<button class="rd" onclick="markRead({{ it.tid }}, this)">✓ 已读</button>{% endif %}
   </div>
   <div class="summary">{{ it.llm_summary }}</div>
   <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}</div>
 </div>
 {% else %}
-<div class="empty">暂无确认爆料</div>
+<div class="empty">{{ '未读爆料清空了 ✨' if show == 'unread' else '暂无确认爆料' }}</div>
 {% endfor %}
 
-<h2>⚔️ 强度结论（置信度排序）</h2>
+<h2>⚔️ 强度结论（{{ '未读' if show == 'unread' else '全部' }} · 置信度排序）
+  <a class="mini" href="?game={{ game }}&show={{ 'all' if show == 'unread' else 'unread' }}">{{ '显示已读' if show == 'unread' else '只看未读' }}</a>
+  <a class="mini" href="#" onclick="return markAll('strength')">本区全部已读</a>
+</h2>
 {% for it in strengths %}
-<div class="card">
+<div class="card {{ 'readed' if it.read }}">
   <div class="head">
     <span class="badge forum">{{ it.forum_kw }}</span>
     <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
@@ -232,12 +307,13 @@ INDEX_TEMPLATE = """<!doctype html>
     <span class="badge conf">conf {{ it.llm_confidence }}</span>
     {% if it.deleted %}<span class="badge del">已删 ⚠️</span>{% endif %}
     {% for t in it.tags %}<span class="badge tag">{{ t }}</span>{% endfor %}
+    {% if not it.read %}<button class="rd" onclick="markRead({{ it.tid }}, this)">✓ 已读</button>{% endif %}
   </div>
   <div class="summary">{{ it.llm_summary }}</div>
   <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}</div>
 </div>
 {% else %}
-<div class="empty">暂无强度结论</div>
+<div class="empty">{{ '未读强度结论清空了 ✨' if show == 'unread' else '暂无强度结论' }}</div>
 {% endfor %}
 
 <h2>🗑️ 删帖监控（被删的帖往往说明爆料是真的）</h2>
@@ -268,6 +344,55 @@ INDEX_TEMPLATE = """<!doctype html>
 </table>
 
 <footer>游戏雷达 · 数据来源：百度贴吧 · LLM 判定：龙虾 (DeepSeek V4)</footer>
+
+<script>
+const GAME = "{{ game }}";
+
+async function markRead(tid, btn) {
+  await fetch('/api/read/' + tid, {method: 'POST'});
+  const card = btn.closest('.card');
+  card.classList.add('readed');
+  btn.remove();
+}
+
+function markAll(topic) {
+  const label = topic === 'leak' ? '爆料' : '强度';
+  if (!confirm('把当前筛选下的「' + label + '」未读全部标记为已读？')) return false;
+  fetch('/api/read_all?topic=' + topic + '&game=' + encodeURIComponent(GAME), {method: 'POST'})
+    .then(() => location.reload());
+  return false;
+}
+
+let crawlWatching = false;
+
+async function startCrawl() {
+  const btn = document.getElementById('crawlbtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 抓取中…（完成后自动刷新）';
+  await fetch('/api/crawl', {method: 'POST'});
+  crawlWatching = true;
+  setTimeout(pollCrawl, 5000);
+}
+
+async function pollCrawl() {
+  try {
+    const s = await (await fetch('/api/crawl/status')).json();
+    if (s.running) {
+      crawlWatching = true;
+      const btn = document.getElementById('crawlbtn');
+      btn.disabled = true;
+      btn.textContent = '⏳ 抓取中…（完成后自动刷新）';
+      setTimeout(pollCrawl, 5000);
+    } else if (crawlWatching) {
+      location.reload();
+    }
+  } catch (e) {
+    setTimeout(pollCrawl, 10000);
+  }
+}
+
+pollCrawl();  // 页面加载时检查是否有抓取正在跑（可能是别的标签页触发的）
+</script>
 </body>
 </html>"""
 
@@ -291,6 +416,8 @@ THREAD_TEMPLATE = """<!doctype html>
     <span class="badge forum">{{ t.forum_kw }}（{{ t.game }} / {{ t.topic }}）</span>
     {% if t.deleted_at %}<span class="badge del">已删于 {{ del_time }} ⚠️</span>{% endif %}
     <span class="badge sig">快照 {{ n_snapshots }} 份</span>
+    <span class="badge conf">已读 ✓</span>
+    <a class="mini" href="#" onclick="return unreadThis(this)">↩ 标为未读</a>
   </div>
   <div class="meta">楼主 {{ t.author_name or '匿名' }} · 首见 {{ first_time }} · 最近活跃 {{ last_time }}</div>
   {% if t.llm_judged %}
@@ -320,6 +447,14 @@ THREAD_TEMPLATE = """<!doctype html>
 {% endfor %}
 
 <footer><a class="ext" href="/">← 返回总览</a></footer>
+
+<script>
+function unreadThis(el) {
+  fetch('/api/unread/{{ t.tid }}', {method: 'POST'})
+    .then(() => { el.textContent = '已恢复未读 ✓'; });
+  return false;
+}
+</script>
 </body>
 </html>"""
 
@@ -385,27 +520,50 @@ def _trend(conn, game: str) -> list[dict]:
 @app.route("/")
 def index():
     game = request.args.get("game", "all")
+    show = request.args.get("show", "unread")  # unread=只看未读（默认），all=含已读
     conn = _conn()
     try:
         games = ["all"] + [r[0] for r in conn.execute(
             "SELECT DISTINCT game FROM forums ORDER BY game").fetchall()]
         game_where = "" if game == "all" else "AND f.game = :game"
+        read_where = "AND t.read_at IS NULL" if show == "unread" else ""
         params = {"game": game}
+
+        # 智能推荐：未读情报按 置信度 + 新鲜度 + 删帖 加权（删帖往往说明爆料是真的）
+        focus = _rows_to_items(conn.execute(f"""
+            SELECT t.tid, t.title, t.forum_kw, t.author_name, t.first_seen, t.deleted_at,
+                   t.llm_confidence, t.llm_summary, t.llm_tags, t.read_at, f.topic,
+                   (COALESCE(t.llm_confidence, 0)
+                    + CASE WHEN t.deleted_at IS NOT NULL THEN 6 ELSE 0 END
+                    + CASE WHEN REPLACE(t.first_seen, 'T', ' ') > DATETIME('now', '-1 day') THEN 5
+                           WHEN REPLACE(t.first_seen, 'T', ' ') > DATETIME('now', '-2 day') THEN 3
+                           WHEN REPLACE(t.first_seen, 'T', ' ') > DATETIME('now', '-4 day') THEN 1
+                           ELSE 0 END) AS score
+            FROM threads t JOIN forums f ON f.kw = t.forum_kw
+            WHERE t.llm_is_leak = 1 AND t.read_at IS NULL {game_where}
+            ORDER BY score DESC, t.first_seen DESC LIMIT 8
+        """, params).fetchall())
+        now = datetime.now(timezone.utc)
+        for it in focus:
+            try:
+                it["fresh"] = (now - datetime.fromisoformat(it["first_seen"])) < timedelta(hours=24)
+            except (ValueError, TypeError):
+                it["fresh"] = False
 
         leaks = _rows_to_items(conn.execute(f"""
             SELECT t.tid, t.title, t.forum_kw, t.author_name, t.first_seen, t.deleted_at,
-                   t.llm_confidence, t.llm_summary, t.llm_tags
+                   t.llm_confidence, t.llm_summary, t.llm_tags, t.read_at
             FROM threads t JOIN forums f ON f.kw = t.forum_kw
-            WHERE f.topic = 'leak' AND t.llm_is_leak = 1 {game_where}
-            ORDER BY t.llm_confidence DESC, t.first_seen DESC LIMIT 30
+            WHERE f.topic = 'leak' AND t.llm_is_leak = 1 {game_where} {read_where}
+            ORDER BY (t.read_at IS NULL) DESC, t.llm_confidence DESC, t.first_seen DESC LIMIT 30
         """, params).fetchall())
 
         strengths = _rows_to_items(conn.execute(f"""
             SELECT t.tid, t.title, t.forum_kw, t.author_name, t.first_seen, t.deleted_at,
-                   t.llm_confidence, t.llm_summary, t.llm_tags
+                   t.llm_confidence, t.llm_summary, t.llm_tags, t.read_at
             FROM threads t JOIN forums f ON f.kw = t.forum_kw
-            WHERE f.topic = 'strength' AND t.llm_is_leak = 1 {game_where}
-            ORDER BY t.llm_confidence DESC, t.first_seen DESC LIMIT 30
+            WHERE f.topic = 'strength' AND t.llm_is_leak = 1 {game_where} {read_where}
+            ORDER BY (t.read_at IS NULL) DESC, t.llm_confidence DESC, t.first_seen DESC LIMIT 30
         """, params).fetchall())
 
         deleted_rows = conn.execute(f"""
@@ -458,6 +616,9 @@ def index():
             "pending": conn.execute(
                 "SELECT COUNT(DISTINCT t.tid) FROM posts p JOIN threads t ON t.tid=p.tid "
                 "WHERE p.is_signal=1 AND (t.llm_judged IS NULL OR t.llm_judged=0)").fetchone()[0],
+            "unread": conn.execute(
+                "SELECT COUNT(*) FROM threads "
+                "WHERE llm_is_leak=1 AND read_at IS NULL").fetchone()[0],
             "flash_only": conn.execute(
                 "SELECT COUNT(*) FROM threads WHERE llm_model='flash'").fetchone()[0],
             "deleted": conn.execute(
@@ -472,7 +633,7 @@ def index():
 
     return render_template_string(
         INDEX_TEMPLATE, stats=stats, leaks=leaks, strengths=strengths,
-        deleted=deleted, logs=logs, games=games, game=game,
+        deleted=deleted, logs=logs, games=games, game=game, show=show, focus=focus,
         trend=trend, tag_stats=tag_stats, authors=authors,
         subtitle="贴吧内鬼爆料 · 强度分析 · 每 5 分钟自动刷新", q="")
 
@@ -487,6 +648,10 @@ def thread_detail(tid: int):
         """, (tid,)).fetchone()
         if not t:
             return "帖子不存在", 404
+        # 点开详情即视为已读
+        if not t["read_at"]:
+            conn.execute("UPDATE threads SET read_at=? WHERE tid=?", (_now_iso(), tid))
+            conn.commit()
         posts = [
             {**dict(p), "time": _fmt_time(p["first_seen"])}
             for p in conn.execute(
@@ -532,6 +697,76 @@ def search():
 
     return render_template_string(
         SEARCH_TEMPLATE, q=q, results=results, subtitle="全文搜索")
+
+
+@app.route("/api/read/<int:tid>", methods=["POST"])
+def api_read(tid: int):
+    conn = _conn()
+    try:
+        conn.execute("UPDATE threads SET read_at=? WHERE tid=?", (_now_iso(), tid))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.route("/api/unread/<int:tid>", methods=["POST"])
+def api_unread(tid: int):
+    conn = _conn()
+    try:
+        conn.execute("UPDATE threads SET read_at=NULL WHERE tid=?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.route("/api/read_all", methods=["POST"])
+def api_read_all():
+    """把某区（leak/strength，可叠加 game 筛选）的未读情报全部标记已读。"""
+    topic = request.args.get("topic")
+    game = request.args.get("game", "all")
+    where, params = "", {"now": _now_iso()}
+    if topic in ("leak", "strength"):
+        where += " AND topic = :topic"
+        params["topic"] = topic
+    if game != "all":
+        where += " AND game = :game"
+        params["game"] = game
+    conn = _conn()
+    try:
+        cur = conn.execute(f"""
+            UPDATE threads SET read_at = :now
+            WHERE read_at IS NULL AND llm_is_leak = 1
+              AND forum_kw IN (SELECT kw FROM forums WHERE 1=1 {where})
+        """, params)
+        conn.commit()
+        n = cur.rowcount
+    finally:
+        conn.close()
+    return {"ok": True, "marked": n}
+
+
+@app.route("/api/crawl", methods=["POST"])
+def api_crawl():
+    """触发一轮完整管线（抓取→预筛→LLM 判定），后台子进程跑，不阻塞页面。"""
+    global _crawl_proc
+    with _crawl_lock:
+        if _crawl_proc is not None and _crawl_proc.poll() is None:
+            return {"running": True, "started": False}
+        _crawl_proc = subprocess.Popen(
+            [sys.executable, "-m", "src.main"],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW：不弹黑框
+        )
+    return {"running": True, "started": True}
+
+
+@app.route("/api/crawl/status")
+def api_crawl_status():
+    running = _crawl_proc is not None and _crawl_proc.poll() is None
+    return {"running": running}
 
 
 def main() -> None:
