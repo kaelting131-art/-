@@ -5,6 +5,7 @@
 图表全部是 Python 侧生成的内联 SVG，零前端依赖、离线可用。
 """
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -311,6 +312,28 @@ BASE_CSS = """
 
   footer { color: var(--faint); font-size: 11px; margin-top: 40px; text-align: center;
     font-family: var(--mono); letter-spacing: 1px; }
+
+  /* ── 版本雷达 ── */
+  .vers { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+  .vcard { display: block; position: relative; text-decoration: none;
+    background: linear-gradient(180deg, var(--bg2), var(--bg1)); border: 1px solid var(--line);
+    padding: 12px 14px; transition: transform .15s, border-color .15s, box-shadow .15s; }
+  .vcard::before, .vcard::after { content: ""; position: absolute; width: 8px; height: 8px; opacity: .8; }
+  .vcard::before { top: -1px; left: -1px; border-top: 1px solid var(--radar); border-left: 1px solid var(--radar); }
+  .vcard::after { bottom: -1px; right: -1px; border-bottom: 1px solid var(--radar); border-right: 1px solid var(--radar); }
+  .vcard:hover { transform: translateY(-2px); border-color: var(--radar-dim);
+    box-shadow: 0 8px 24px rgba(46,229,157,.08); }
+  .vcard .vnum { font-family: var(--mono); font-size: 24px; font-weight: 700; color: var(--radar);
+    text-shadow: 0 0 16px var(--radar-glow); line-height: 1.15; }
+  .vcard.amber::before, .vcard.amber::after { border-color: var(--amber); }
+  .vcard.amber .vnum { color: var(--amber); text-shadow: 0 0 16px var(--amber-glow); }
+  .vcard.amber:hover { border-color: #8a6020; box-shadow: 0 8px 24px var(--amber-glow); }
+  .vcard .vgame { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .vcard .vtags { margin-top: 7px; display: flex; gap: 5px; flex-wrap: wrap; }
+  .vcard .vtags span { font-size: 10px; font-family: var(--mono); color: var(--ice);
+    border: 1px solid #2a566e; padding: 0 6px; }
+  .vcard .vtop { font-size: 12px; color: #9fb4ad; margin-top: 8px; line-height: 1.5;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 """
 
 FONT_LINKS = """
@@ -404,6 +427,22 @@ INDEX_TEMPLATE = """<!doctype html>
   <div class="empty">未读情报全部清空 ✦ 点「立即扫描」拉新一轮</div>
   {% endfor %}
 </div>
+
+{% if versions %}
+<div class="sec">
+  <div class="sec-title">版本雷达 <span style="font-size:11px;color:var(--faint);font-family:var(--mono)">从确认情报自动提取版本号 · 点卡片看该版本全部线索</span></div>
+  <div class="vers">
+    {% for v in versions %}
+    <a class="vcard {{ 'amber' if v.game == '鸣潮' }}" href="/search?q={{ v.ver }}">
+      <div class="vnum">v{{ v.ver }}</div>
+      <div class="vgame">{{ v.game }} · {{ v.n }} 条情报</div>
+      <div class="vtags">{% for t in v.tags %}<span>{{ t }}</span>{% endfor %}</div>
+      {% if v.top %}<div class="vtop">{{ v.top }}</div>{% endif %}
+    </a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
 
 <div class="sec">
   <div class="cols">
@@ -785,6 +824,42 @@ def _trend_svg(trend: list[dict]) -> str:
     return "".join(s)
 
 
+# 版本号提取：匹配 "3.5" 这类 主版本.次版本，排除 "1.5倍"/"13w"/日期等干扰
+_RE_VER = re.compile(r"(?<![\d.])([1-9]\.\d)(?![\d.倍万亿秒分%折wWkK金])")
+
+
+def _version_radar(conn, game_where: str, params: dict) -> list[dict]:
+    """从已确认情报的 标题+摘要 里提取版本号，按 游戏×版本 聚合成前瞻路线。"""
+    rows = conn.execute(f"""
+        SELECT t.title, t.llm_summary, t.llm_tags, t.llm_confidence, t.first_seen, f.game
+        FROM threads t JOIN forums f ON f.kw = t.forum_kw
+        WHERE t.llm_is_leak = 1 {game_where}
+    """, params).fetchall()
+    buckets: dict = {}
+    for r in rows:
+        text = f"{r['title'] or ''} {r['llm_summary'] or ''}"
+        for v in set(_RE_VER.findall(text)):
+            b = buckets.setdefault((r["game"], v), {
+                "n": 0, "tags": Counter(), "best_conf": -1, "best_sum": "", "latest": "",
+            })
+            b["n"] += 1
+            b["tags"].update(_parse_tags(r["llm_tags"]))
+            conf = r["llm_confidence"] or 0
+            if conf > b["best_conf"]:
+                b["best_conf"], b["best_sum"] = conf, (r["llm_summary"] or "")
+            b["latest"] = max(b["latest"], r["first_seen"] or "")
+    # 先按最近活跃取前 8 个版本（避免老版本挤掉新爆料），再按 游戏+版本号 升序排成路线图
+    hot = sorted(buckets.items(), key=lambda kv: kv[1]["latest"], reverse=True)[:8]
+    out = [
+        {"game": g, "ver": v, "n": b["n"],
+         "tags": [t for t, _ in b["tags"].most_common(3)],
+         "top": b["best_sum"][:64], "conf": b["best_conf"]}
+        for (g, v), b in hot
+    ]
+    out.sort(key=lambda x: (x["game"], [int(p) for p in x["ver"].split(".")]))
+    return out
+
+
 # ─────────────────────────── 路由 ───────────────────────────
 
 @app.route("/")
@@ -920,6 +995,7 @@ def index():
         }
 
         chart_svg = _trend_svg(_trend(conn, game))
+        versions = _version_radar(conn, game_where, params)
     finally:
         conn.close()
 
@@ -927,7 +1003,7 @@ def index():
         INDEX_TEMPLATE, stats=stats, leaks=leaks, strengths=strengths,
         deleted=deleted, logs=logs, games=games, game=game, show=show, focus=focus,
         chart_svg=chart_svg, tag_stats=tag_stats, authors=authors,
-        forum_matrix=forum_matrix, game_split=game_split,
+        forum_matrix=forum_matrix, game_split=game_split, versions=versions,
         subtitle="贴吧内鬼爆料 · 强度分析", q="")
 
 
