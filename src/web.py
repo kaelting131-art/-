@@ -1,5 +1,8 @@
 """游戏雷达 Web 仪表盘。本地只读看板，展示已判定的爆料/强度情报。
 启动：python -m src.web   →  http://127.0.0.1:8787
+
+视觉方向「相控阵雷达终端」：磷光绿 HUD + 等宽数字 + 雷达扫描动画。
+图表全部是 Python 侧生成的内联 SVG，零前端依赖、离线可用。
 """
 import json
 import sqlite3
@@ -69,6 +72,12 @@ def _parse_tags(raw: str | None) -> list[str]:
         return []
 
 
+def _conf_cls(v) -> str:
+    if not v:
+        return "lo"
+    return "hi" if v >= 8 else ("mid" if v >= 5 else "lo")
+
+
 def _rows_to_items(rows) -> list[dict]:
     items = []
     for r in rows:
@@ -77,108 +86,279 @@ def _rows_to_items(rows) -> list[dict]:
         d["time"] = _fmt_time(d.get("first_seen"))
         d["deleted"] = bool(d.get("deleted_at"))
         d["read"] = bool(d.get("read_at"))
+        d["conf"] = d.get("llm_confidence") or 0
+        d["conf_cls"] = _conf_cls(d.get("llm_confidence"))
         items.append(d)
     return items
 
 
+# ─────────────────────────── 样式 ───────────────────────────
+
 BASE_CSS = """
   :root {
-    --bg: #0f1117; --panel: #171a23; --border: #262b38;
-    --text: #d7dce5; --dim: #8b93a3; --accent: #e8a33d;
-    --leak: #e06c75; --strength: #61afef; --ok: #98c379;
+    --bg0: #06090b; --bg1: #0b1014; --bg2: #10171c;
+    --line: #1c2830; --line-hi: #2a3c46;
+    --ink: #cfe3dc; --dim: #6d8089; --faint: #45565e;
+    --radar: #2ee59d; --radar-dim: #1a8f64; --radar-glow: rgba(46,229,157,.16);
+    --amber: #ffb648; --amber-glow: rgba(255,182,72,.14);
+    --ice: #5cc8ff; --ice-glow: rgba(92,200,255,.13);
+    --red: #ff5664; --red-glow: rgba(255,86,100,.15);
+    --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+    --disp: "Rajdhani", "Cascadia Mono", "Microsoft YaHei", sans-serif;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text);
-         font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-         padding: 24px; max-width: 1100px; margin: 0 auto; }
-  h1 { font-size: 20px; margin-bottom: 4px; }
-  h1 a { color: var(--text); text-decoration: none; }
-  h1 .sub { color: var(--dim); font-size: 13px; font-weight: normal; margin-left: 8px; }
-  h2 { font-size: 15px; margin: 28px 0 10px; color: var(--accent); }
-  .topbar { display: flex; align-items: center; justify-content: space-between;
-            flex-wrap: wrap; gap: 10px; }
-  .searchbox input { background: var(--panel); border: 1px solid var(--border);
-                     color: var(--text); border-radius: 8px; padding: 7px 12px; width: 240px; }
-  .searchbox input:focus { outline: none; border-color: var(--accent); }
-  .chips { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0 4px; }
-  .chip { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-          padding: 8px 14px; text-align: center; min-width: 88px; }
-  .chip b { display: block; font-size: 18px; color: var(--accent); }
-  .chip span { font-size: 12px; color: var(--dim); }
-  .filters { margin: 10px 0; font-size: 13px; }
-  .filters a { color: var(--dim); text-decoration: none; margin-right: 12px;
-               padding: 2px 10px; border-radius: 6px; border: 1px solid transparent; }
-  .filters a.on { color: var(--accent); border-color: var(--accent); }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-          padding: 12px 16px; margin-bottom: 10px; }
-  .card .head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-  .card a.title { color: var(--text); font-weight: 600; text-decoration: none; }
-  .card a.title:hover { color: var(--accent); }
-  a.ext { color: var(--dim); text-decoration: none; font-size: 12px; }
-  a.ext:hover { color: var(--accent); }
-  .badge { font-size: 11px; border-radius: 5px; padding: 1px 7px; white-space: nowrap; }
-  .badge.forum { background: #20253244; border: 1px solid var(--border); color: var(--dim); }
-  .badge.conf { border: 1px solid var(--ok); color: var(--ok); }
-  .badge.del { background: var(--leak); color: #fff; }
-  .badge.tag { border: 1px solid var(--strength); color: var(--strength); }
-  .badge.sig { border: 1px solid var(--accent); color: var(--accent); }
-  .summary { color: var(--dim); margin-top: 4px; }
-  .meta { color: var(--dim); font-size: 12px; margin-top: 4px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
-  th { color: var(--dim); font-weight: normal; }
-  td.err { color: var(--leak); max-width: 320px; overflow: hidden;
-           text-overflow: ellipsis; white-space: nowrap; }
-  .empty { color: var(--dim); padding: 16px; text-align: center; }
-  footer { color: var(--dim); font-size: 12px; margin-top: 28px; text-align: center; }
-  /* 趋势图 */
-  .trend { display: flex; align-items: flex-end; gap: 6px; height: 110px;
-           background: var(--panel); border: 1px solid var(--border);
-           border-radius: 10px; padding: 14px 16px 26px; position: relative; }
-  .trend .day { flex: 1; display: flex; flex-direction: column; justify-content: flex-end;
-                align-items: center; height: 100%; position: relative; }
-  .trend .bar { width: 70%; max-width: 26px; background: #3a4154; border-radius: 3px 3px 0 0;
-                display: flex; flex-direction: column; justify-content: flex-end; }
-  .trend .bar .hit { background: var(--accent); border-radius: 3px 3px 0 0; width: 100%; }
-  .trend .lbl { position: absolute; bottom: -22px; font-size: 10px; color: var(--dim);
-                white-space: nowrap; }
-  .trend .num { font-size: 10px; color: var(--dim); margin-bottom: 2px; }
-  .legend { font-size: 12px; color: var(--dim); margin-top: 6px; }
-  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
-              margin: 0 4px 0 12px; vertical-align: -1px; }
-  /* 标签云 */
-  .tags { display: flex; gap: 8px; flex-wrap: wrap; }
-  .tags .t { background: var(--panel); border: 1px solid var(--strength);
-             color: var(--strength); border-radius: 14px; padding: 3px 12px; font-size: 13px; }
-  .tags .t b { color: var(--text); margin-left: 4px; }
-  /* 楼层 */
-  .floor { border-left: 3px solid var(--border); padding: 8px 14px; margin: 8px 0; }
-  .floor.sig { border-left-color: var(--accent); }
-  .floor .who { color: var(--dim); font-size: 12px; margin-bottom: 2px; }
-  .floor .txt { white-space: pre-wrap; word-break: break-word; }
-  /* 工具栏 / 已读 / 智能推荐 */
-  .toolbar { display: flex; align-items: center; gap: 12px; margin: 12px 0 4px; flex-wrap: wrap; }
-  .toolbar button { background: var(--accent); color: #1a1505; border: none; border-radius: 8px;
-                    padding: 7px 16px; font-weight: 600; cursor: pointer; font-size: 13px; }
-  .toolbar button:disabled { opacity: .55; cursor: wait; }
+  html { scrollbar-color: var(--line-hi) var(--bg0); }
+  body {
+    background: var(--bg0); color: var(--ink);
+    font: 14px/1.65 "Microsoft YaHei", "PingFang SC", sans-serif;
+    padding: 26px 28px 60px; max-width: 1280px; margin: 0 auto;
+    position: relative;
+  }
+  /* 网格底纹 + 顶部辉光 */
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: -2; pointer-events: none;
+    background:
+      radial-gradient(ellipse 70% 38% at 50% -6%, rgba(46,229,157,.07), transparent),
+      linear-gradient(90deg, rgba(46,229,157,.025) 1px, transparent 1px),
+      linear-gradient(0deg, rgba(46,229,157,.02) 1px, transparent 1px);
+    background-size: auto, 44px 44px, 44px 44px;
+  }
+  /* 扫描线 */
+  body::after {
+    content: ""; position: fixed; inset: 0; z-index: 99; pointer-events: none;
+    background: repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px);
+    opacity: .14;
+  }
+  ::selection { background: var(--radar-dim); color: #fff; }
+  ::-webkit-scrollbar { width: 10px; }
+  ::-webkit-scrollbar-track { background: var(--bg0); }
+  ::-webkit-scrollbar-thumb { background: var(--line-hi); border-radius: 5px; }
+  a { color: inherit; }
+  :focus-visible { outline: 1px solid var(--radar); outline-offset: 2px; }
+
+  /* ── 顶栏 ── */
+  .topbar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .radar-logo { width: 40px; height: 40px; border-radius: 50%; position: relative; flex-shrink: 0;
+    border: 1px solid var(--radar-dim);
+    background:
+      radial-gradient(circle, var(--radar) 0 2px, transparent 2.5px),
+      repeating-radial-gradient(circle, transparent 0 8px, rgba(46,229,157,.18) 8px 9px);
+    box-shadow: 0 0 18px var(--radar-glow), inset 0 0 12px rgba(46,229,157,.08); }
+  .radar-logo::before { content: ""; position: absolute; inset: 0; border-radius: 50%;
+    background: conic-gradient(from 0deg, rgba(46,229,157,.55), transparent 70deg, transparent);
+    animation: sweep 3.6s linear infinite; }
+  body.crawling .radar-logo::before { animation-duration: .8s; }
+  @keyframes sweep { to { transform: rotate(360deg); } }
+  .brand h1 { font-family: var(--disp); font-size: 24px; font-weight: 700; letter-spacing: 1px; line-height: 1.1; }
+  .brand h1 a { color: var(--ink); text-decoration: none; text-shadow: 0 0 22px var(--radar-glow); }
+  .brand .sys { font-family: var(--mono); font-size: 10px; letter-spacing: 3px;
+    color: var(--radar); text-transform: uppercase; opacity: .85; }
+  .topbar .sub { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+  .searchbox { margin-left: auto; position: relative; }
+  .searchbox::before { content: ">"; position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+    color: var(--radar); font-family: var(--mono); font-size: 13px; pointer-events: none; }
+  .searchbox input { background: var(--bg1); border: 1px solid var(--line); color: var(--ink);
+    padding: 8px 14px 8px 28px; width: 250px; font-family: var(--mono); font-size: 13px;
+    clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px); }
+  .searchbox input:focus { outline: none; border-color: var(--radar-dim); background: var(--bg2); }
+  .searchbox input::placeholder { color: var(--faint); }
+
+  /* ── 分区 ── */
+  .sec { margin-top: 30px; animation: rise .5s .05s both; }
+  .sec:nth-of-type(2) { animation-delay: .1s; } .sec:nth-of-type(3) { animation-delay: .16s; }
+  .sec:nth-of-type(4) { animation-delay: .22s; } .sec:nth-of-type(5) { animation-delay: .28s; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .sec { animation: none; } .radar-logo::before { animation: none; } }
+  .sec-title { display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+    font-family: var(--disp); font-size: 15px; font-weight: 600; letter-spacing: 1px; color: var(--ink); }
+  .sec-title::before { content: "//"; color: var(--radar); font-family: var(--mono); font-weight: 400; }
+  .sec-title::after { content: ""; flex: 1; height: 1px;
+    background: linear-gradient(90deg, var(--line-hi), transparent); }
+  .sec-title .mini { margin-left: 0; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } body { padding: 18px 14px 50px; } }
+
+  /* ── 状态卡 ── */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px; margin-top: 20px; }
+  .stat { position: relative; background: linear-gradient(180deg, var(--bg2), var(--bg1));
+    border: 1px solid var(--line); padding: 12px 14px 10px; }
+  .stat::before, .stat::after { content: ""; position: absolute; width: 8px; height: 8px; opacity: .8; }
+  .stat::before { top: -1px; left: -1px; border-top: 1px solid var(--radar); border-left: 1px solid var(--radar); }
+  .stat::after { bottom: -1px; right: -1px; border-bottom: 1px solid var(--radar); border-right: 1px solid var(--radar); }
+  .stat b { display: block; font-family: var(--mono); font-size: 22px; font-weight: 600; color: var(--radar);
+    text-shadow: 0 0 14px var(--radar-glow); line-height: 1.2; }
+  .stat span { font-size: 11px; color: var(--dim); letter-spacing: 1px; }
+  .stat.amber b { color: var(--amber); text-shadow: 0 0 14px var(--amber-glow); }
+  .stat.amber::before { border-color: var(--amber); } .stat.amber::after { border-color: var(--amber); }
+  .stat.ice b { color: var(--ice); text-shadow: 0 0 14px var(--ice-glow); }
+  .stat.ice::before { border-color: var(--ice); } .stat.ice::after { border-color: var(--ice); }
+  .stat.red b { color: var(--red); text-shadow: 0 0 14px var(--red-glow); }
+  .stat.red::before { border-color: var(--red); } .stat.red::after { border-color: var(--red); }
+  .stat.dimmed b { color: var(--dim); text-shadow: none; }
+  .stat.wide b { font-size: 15px; padding-top: 5px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--radar);
+    margin-right: 6px; box-shadow: 0 0 8px var(--radar); animation: blink 2.4s infinite; vertical-align: 1px; }
+  @keyframes blink { 50% { opacity: .35; } }
+
+  /* ── 控制条 ── */
+  .toolbar { display: flex; align-items: center; gap: 14px; margin-top: 14px; flex-wrap: wrap; }
+  .btn { font-family: var(--disp); font-size: 14px; font-weight: 700; letter-spacing: 2px;
+    background: linear-gradient(135deg, var(--radar), #19b97a); color: #04130c; border: none;
+    padding: 9px 22px; cursor: pointer;
+    clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+    transition: filter .15s, transform .15s; }
+  .btn:hover { filter: brightness(1.15); transform: translateY(-1px); }
+  .btn:disabled { filter: grayscale(.5) brightness(.75); cursor: wait; transform: none; animation: pulse 1.6s infinite; }
+  @keyframes pulse { 50% { opacity: .65; } }
   .toolbar .hint { color: var(--dim); font-size: 12px; }
-  a.mini, button.rd { font-size: 12px; font-weight: normal; color: var(--dim); background: none;
-                      border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px;
-                      cursor: pointer; text-decoration: none; }
-  a.mini:hover, button.rd:hover { color: var(--accent); border-color: var(--accent); }
+  .filters { display: flex; gap: 8px; margin-left: auto; }
+  .filters a { color: var(--dim); text-decoration: none; font-size: 12px; font-family: var(--mono);
+    padding: 4px 12px; border: 1px solid transparent; }
+  .filters a.on { color: var(--radar); border-color: var(--radar-dim); background: var(--radar-glow); }
+  .filters a:hover { color: var(--ink); }
+
+  /* ── 图表面板 ── */
+  .panel { background: var(--bg1); border: 1px solid var(--line); padding: 16px 18px; position: relative; }
+  .panel::before { content: ""; position: absolute; top: -1px; left: -1px; width: 10px; height: 10px;
+    border-top: 1px solid var(--radar); border-left: 1px solid var(--radar); opacity: .7; }
+  .panel h3 { font-family: var(--mono); font-size: 11px; letter-spacing: 2px; color: var(--dim);
+    text-transform: uppercase; margin-bottom: 12px; }
+  .chart-svg { width: 100%; height: auto; display: block; }
+  .legend { font-size: 11px; color: var(--dim); font-family: var(--mono); margin-top: 8px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; margin: 0 5px 0 14px; vertical-align: -1px; }
+  .legend i:first-child { margin-left: 0; }
+  /* 横向条形 */
+  .hbar { display: grid; grid-template-columns: 70px 1fr 34px; align-items: center; gap: 10px; margin: 7px 0; }
+  .hbar .lbl { font-size: 12px; color: var(--ink); text-align: right; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .hbar .track { height: 9px; background: var(--bg2); position: relative; overflow: hidden; }
+  .hbar .fill { position: absolute; inset: 0 auto 0 0; background: linear-gradient(90deg, var(--radar-dim), var(--radar));
+    box-shadow: 0 0 10px var(--radar-glow); animation: grow .8s .2s both cubic-bezier(.2,.8,.3,1); }
+  .hbar.amber .fill { background: linear-gradient(90deg, #b97c1e, var(--amber)); box-shadow: 0 0 10px var(--amber-glow); }
+  .hbar.ice .fill { background: linear-gradient(90deg, #2a7aab, var(--ice)); box-shadow: 0 0 10px var(--ice-glow); }
+  @keyframes grow { from { transform: scaleX(0); transform-origin: left; } }
+  .hbar .num { font-family: var(--mono); font-size: 12px; color: var(--dim); text-align: right; }
+  /* 游戏占比分割条 */
+  .split { display: flex; height: 26px; overflow: hidden; font-family: var(--mono); font-size: 11px; }
+  .split > div { display: flex; align-items: center; justify-content: center; gap: 6px; min-width: 56px;
+    transition: width .8s cubic-bezier(.2,.8,.3,1); }
+  .split .g0 { background: linear-gradient(135deg, rgba(46,229,157,.28), rgba(46,229,157,.1));
+    border: 1px solid var(--radar-dim); color: var(--radar); }
+  .split .g1 { background: linear-gradient(135deg, rgba(255,182,72,.26), rgba(255,182,72,.08));
+    border: 1px solid #8a6020; color: var(--amber); }
+  /* 情报源矩阵 */
+  .matrix { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .matrix td { padding: 5px 6px; border-bottom: 1px solid var(--line); }
+  .matrix td.n { font-family: var(--mono); color: var(--dim); text-align: right; white-space: nowrap; }
+  .matrix .track { height: 7px; background: var(--bg2); min-width: 60px; }
+  .matrix .fill { height: 100%; background: linear-gradient(90deg, var(--radar-dim), var(--radar)); }
+
+  /* ── 情报卡 ── */
+  .card { background: var(--bg1); border: 1px solid var(--line); border-left: 3px solid var(--line-hi);
+    padding: 12px 16px; margin-bottom: 10px; position: relative; transition: border-color .15s, transform .15s, box-shadow .15s; }
+  .card:hover { border-color: var(--line-hi); border-left-color: var(--radar);
+    transform: translateY(-1px); box-shadow: 0 6px 22px rgba(0,0,0,.45); }
+  .card.leak { border-left-color: var(--amber); }
+  .card.strength { border-left-color: var(--ice); }
+  .card .head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .card a.title { color: var(--ink); font-weight: 600; text-decoration: none; }
+  .card a.title:hover { color: var(--radar); }
+  a.ext { color: var(--faint); text-decoration: none; font-size: 12px; font-family: var(--mono); }
+  a.ext:hover { color: var(--radar); }
+  .badge { font-size: 11px; padding: 1px 8px; white-space: nowrap; font-family: var(--mono); }
+  .badge.forum { background: var(--bg2); border: 1px solid var(--line); color: var(--dim); }
+  .badge.del { background: var(--red); color: #fff; }
+  .badge.tag { border: 1px solid #2a566e; color: var(--ice); }
+  .badge.sig { border: 1px solid #7a5a1e; color: var(--amber); }
+  .badge.ok { border: 1px solid var(--radar-dim); color: var(--radar); }
+  .summary { color: #9fb4ad; margin-top: 5px; }
+  .meta { color: var(--faint); font-size: 12px; margin-top: 5px; font-family: var(--mono); }
+  /* 置信度能量条 */
+  .meter { display: inline-flex; gap: 2px; align-items: center; vertical-align: -1px; }
+  .meter i { width: 5px; height: 10px; background: var(--bg2); border: 1px solid var(--line); }
+  .meter i.f { border: none; }
+  .meter.hi i.f { background: var(--radar); box-shadow: 0 0 5px var(--radar-glow); }
+  .meter.mid i.f { background: var(--amber); box-shadow: 0 0 5px var(--amber-glow); }
+  .meter.lo i.f { background: var(--red); box-shadow: 0 0 5px var(--red-glow); }
+  .meter-lbl { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-left: 4px; }
+  /* 推荐卡 */
+  .card.focus { background: linear-gradient(180deg, #131711, var(--bg1)); border-color: #3d4a28;
+    border-left: 3px solid var(--radar); }
+  .card.focus:hover { box-shadow: 0 6px 26px rgba(46,229,157,.08); }
+  .score { font-family: var(--mono); font-size: 12px; font-weight: 700; color: #04130c;
+    background: var(--radar); padding: 1px 8px;
+    clip-path: polygon(5px 0, 100% 0, 100% calc(100% - 5px), calc(100% - 5px) 100%, 0 100%, 0 5px); }
+  .card.readed { opacity: .38; }
+  a.mini, button.rd { font-size: 11px; font-family: var(--mono); color: var(--dim); background: none;
+    border: 1px solid var(--line); padding: 1px 9px; cursor: pointer; text-decoration: none; font-weight: 400; }
+  a.mini:hover, button.rd:hover { color: var(--radar); border-color: var(--radar-dim); }
   button.rd { margin-left: auto; flex-shrink: 0; }
-  .card.readed { opacity: .4; }
-  .card.focus { border-color: #6a5524; background: #1d1a13; }
-  .score { color: var(--accent); font-size: 12px; font-weight: 700; }
+  .empty { color: var(--faint); padding: 22px; text-align: center; border: 1px dashed var(--line);
+    font-family: var(--mono); font-size: 12px; }
+
+  /* ── 表格（日志）── */
+  table.log { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--mono); }
+  table.log th, table.log td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  table.log th { color: var(--faint); font-weight: normal; letter-spacing: 1px; font-size: 11px; }
+  table.log td.err { color: var(--red); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  table.log .ok-dot { color: var(--radar); }
+
+  /* ── 楼层（详情页）── */
+  .floor { border-left: 2px solid var(--line); padding: 9px 14px; margin: 8px 0; background: var(--bg1); }
+  .floor.sig { border-left-color: var(--radar); background: linear-gradient(90deg, rgba(46,229,157,.05), var(--bg1) 40%); }
+  .floor .who { color: var(--dim); font-size: 12px; margin-bottom: 3px; font-family: var(--mono); }
+  .floor .txt { white-space: pre-wrap; word-break: break-word; }
+
+  footer { color: var(--faint); font-size: 11px; margin-top: 40px; text-align: center;
+    font-family: var(--mono); letter-spacing: 1px; }
+"""
+
+FONT_LINKS = """
+<link rel="preconnect" href="https://fonts.loli.net">
+<link href="https://fonts.loli.net/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
 """
 
 HEADER = """
 <div class="topbar">
-  <h1><a href="/">🎮 游戏雷达</a> <span class="sub">{{ subtitle }}</span></h1>
+  <div class="radar-logo" aria-hidden="true"></div>
+  <div class="brand">
+    <h1><a href="/">游戏雷达</a></h1>
+    <div class="sys">GAME RADAR // TIEBA SIGNAL INTEL</div>
+  </div>
+  <span class="sub">{{ subtitle }}</span>
   <form class="searchbox" action="/search" method="get">
-    <input name="q" placeholder="搜索全部楼层内容…" value="{{ q or '' }}">
+    <input name="q" placeholder="全文检索情报…" value="{{ q or '' }}">
   </form>
 </div>
+"""
+
+# Jinja 宏：置信度能量条
+METER_MACRO = """
+{% macro meter(it) -%}
+<span class="meter {{ it.conf_cls }}" title="置信度 {{ it.conf }}/10">
+  {%- for i in range(10) %}<i class="{{ 'f' if i < it.conf }}"></i>{% endfor -%}
+</span><span class="meter-lbl">{{ it.conf }}</span>
+{%- endmacro %}
+"""
+
+# 情报卡片（首页两栏 + 推荐区共用）
+CARD_MACRO = """
+{% macro intel_card(it, kind, focus=False) -%}
+<div class="card {{ kind }} {{ 'focus' if focus }} {{ 'readed' if it.read }}">
+  <div class="head">
+    {% if focus %}<span class="score">{{ it.score }}</span>{% endif %}
+    <span class="badge forum">{{ it.forum_kw }}</span>
+    <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
+    <a class="ext" href="https://tieba.baidu.com/p/{{ it.tid }}" target="_blank">↗</a>
+    {% if it.fresh %}<span class="badge ok">NEW·24h</span>{% endif %}
+    {% if it.deleted %}<span class="badge del">已删 ⚠</span>{% endif %}
+    {% for t in it.tags %}<span class="badge tag">{{ t }}</span>{% endfor %}
+    {% if not it.read %}<button class="rd" onclick="markRead({{ it.tid }}, this)">✓ 已读</button>{% endif %}
+  </div>
+  <div class="summary">{{ it.llm_summary }}</div>
+  <div class="meta">{{ meter(it) }} · {{ it.author_name or '匿名' }} · {{ it.time }}</div>
+</div>
+{%- endmacro %}
 """
 
 INDEX_TEMPLATE = """<!doctype html>
@@ -188,165 +368,184 @@ INDEX_TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="300">
 <title>游戏雷达</title>
+""" + FONT_LINKS + """
 <style>""" + BASE_CSS + """</style>
 </head>
 <body>
-""" + HEADER + """
+""" + METER_MACRO + CARD_MACRO + HEADER + """
 
-<div class="chips">
-  <div class="chip"><b>{{ stats.threads }}</b><span>帖子</span></div>
-  <div class="chip"><b>{{ stats.posts }}</b><span>楼层</span></div>
-  <div class="chip"><b>{{ stats.signals }}</b><span>预筛命中</span></div>
-  <div class="chip"><b>{{ stats.leaks }}</b><span>确认爆料</span></div>
-  <div class="chip"><b>{{ stats.strength }}</b><span>强度结论</span></div>
-  <div class="chip"><b>{{ stats.unread }}</b><span>未读情报</span></div>
-  <div class="chip"><b>{{ stats.pending }}</b><span>待判定</span></div>
-  <div class="chip"><b>{{ stats.flash_only }}</b><span>flash筛掉</span></div>
-  <div class="chip"><b>{{ stats.deleted }}</b><span>已删帖</span></div>
-  <div class="chip"><b>{{ stats.last_crawl }}</b><span>最近抓取</span></div>
-</div>
-
-<div class="filters">
-  {% for g in games %}
-  <a href="?game={{ g }}&show={{ show }}" class="{{ 'on' if g == game else '' }}">{{ '全部' if g == 'all' else g }}</a>
-  {% endfor %}
+<div class="stats">
+  <div class="stat"><b data-count="{{ stats.threads }}">{{ stats.threads }}</b><span>帖子</span></div>
+  <div class="stat"><b data-count="{{ stats.posts }}">{{ stats.posts }}</b><span>楼层</span></div>
+  <div class="stat dimmed"><b data-count="{{ stats.signals }}">{{ stats.signals }}</b><span>预筛命中</span></div>
+  <div class="stat amber"><b data-count="{{ stats.leaks }}">{{ stats.leaks }}</b><span>确认爆料</span></div>
+  <div class="stat ice"><b data-count="{{ stats.strength }}">{{ stats.strength }}</b><span>强度结论</span></div>
+  <div class="stat"><b data-count="{{ stats.unread }}">{{ stats.unread }}</b><span>未读情报</span></div>
+  <div class="stat dimmed"><b data-count="{{ stats.flash_only }}">{{ stats.flash_only }}</b><span>flash 筛掉</span></div>
+  <div class="stat red"><b data-count="{{ stats.deleted }}">{{ stats.deleted }}</b><span>已删帖</span></div>
+  <div class="stat wide"><b><span class="dot"></span>{{ stats.last_crawl }}</b><span>最近扫描</span></div>
 </div>
 
 <div class="toolbar">
-  <button id="crawlbtn" onclick="startCrawl()">🔄 立即抓取</button>
-  <span class="hint">手动触发一轮：抓取 → 预筛 → LLM 判定（约 5-10 分钟），完成后自动刷新</span>
-</div>
-
-<h2>🔥 智能推荐（未读 · 置信度 + 新鲜度 + 删帖加权）</h2>
-{% for it in focus %}
-<div class="card focus">
-  <div class="head">
-    <span class="score">{{ it.score }}分</span>
-    <span class="badge forum">{{ '🕵️' if it.topic == 'leak' else '⚔️' }} {{ it.forum_kw }}</span>
-    <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
-    <a class="ext" href="https://tieba.baidu.com/p/{{ it.tid }}" target="_blank">贴吧↗</a>
-    <span class="badge conf">conf {{ it.llm_confidence }}</span>
-    {% if it.fresh %}<span class="badge sig">🆕 24h</span>{% endif %}
-    {% if it.deleted %}<span class="badge del">已删 ⚠️</span>{% endif %}
-    {% for t in it.tags %}<span class="badge tag">{{ t }}</span>{% endfor %}
-    <button class="rd" onclick="markRead({{ it.tid }}, this)">✓ 已读</button>
+  <button id="crawlbtn" class="btn" onclick="startCrawl()">🔄 立即扫描</button>
+  <span class="hint">抓取 → 预筛 → LLM 判定（约 5-10 分钟），完成后自动刷新</span>
+  <div class="filters">
+    {% for g in games %}
+    <a href="?game={{ g }}&show={{ show }}" class="{{ 'on' if g == game else '' }}">{{ '全部' if g == 'all' else g }}</a>
+    {% endfor %}
   </div>
-  <div class="summary">{{ it.llm_summary }}</div>
-  <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}</div>
 </div>
-{% else %}
-<div class="empty">未读情报全部看完了 ✨（点「立即抓取」拉一轮新的）</div>
-{% endfor %}
 
-<h2>📈 近 14 天动态</h2>
-<div class="trend">
-  {% for d in trend %}
-  <div class="day">
-    <div class="num">{{ d.total if d.total else '' }}</div>
-    <div class="bar" style="height: {{ d.h }}%">
-      <div class="hit" style="height: {{ d.hit_pct }}%"></div>
+<div class="sec">
+  <div class="sec-title">智能推荐 <span style="font-size:11px;color:var(--faint);font-family:var(--mono)">未读 · 置信度+新鲜度+删帖加权</span></div>
+  {% for it in focus %}
+  {{ intel_card(it, it.topic, focus=True) }}
+  {% else %}
+  <div class="empty">未读情报全部清空 ✦ 点「立即扫描」拉新一轮</div>
+  {% endfor %}
+</div>
+
+<div class="sec">
+  <div class="cols">
+    <div class="panel">
+      <h3>近 14 天信号量</h3>
+      {{ chart_svg | safe }}
+      <div class="legend"><i style="background:var(--radar-dim)"></i>新帖<i style="background:var(--amber)"></i>确认情报</div>
     </div>
-    <div class="lbl">{{ d.label }}</div>
+    <div>
+      <div class="panel" style="margin-bottom:18px">
+        <h3>情报构成 · 按游戏</h3>
+        <div class="split">
+          {% for g in game_split %}
+          <div class="g{{ loop.index0 }}" style="width:{{ g.pct }}%">{{ g.game }} {{ g.n }}</div>
+          {% endfor %}
+        </div>
+        {% if tag_stats %}
+        <h3 style="margin-top:16px">标签热度</h3>
+        {% set tmax = tag_stats[0][1] %}
+        {% for t, n in tag_stats[:7] %}
+        <div class="hbar {{ 'amber' if loop.index0 % 2 else '' }}">
+          <span class="lbl">{{ t }}</span>
+          <span class="track"><span class="fill" style="width:{{ (n / tmax * 100) | round }}%"></span></span>
+          <span class="num">{{ n }}</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>情报源矩阵</h3>
+        <table class="matrix">
+          {% for f in forum_matrix %}
+          <tr>
+            <td>{{ '🕵️' if f.topic == 'leak' else '⚔️' }} {{ f.name }}</td>
+            <td><div class="track"><div class="fill" style="width:{{ f.pct }}%"></div></div></td>
+            <td class="n">{{ f.n_intel }}/{{ f.n_threads }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+    </div>
   </div>
-  {% endfor %}
 </div>
-<div class="legend">柱高 = 新帖数<i style="background:#3a4154"></i>新帖<i style="background:var(--accent)"></i>其中确认情报</div>
 
-{% if tag_stats %}
-<h2>🏷️ 情报标签分布</h2>
-<div class="tags">
-  {% for t, n in tag_stats %}<span class="t">{{ t }}<b>{{ n }}</b></span>{% endfor %}
-</div>
-{% endif %}
-
-{% if authors %}
-<h2>👤 情报源排行（确认情报的楼主）</h2>
-<table>
-  <tr><th>楼主</th><th>确认情报数</th><th>平均置信度</th><th>主要活跃吧</th></tr>
-  {% for a in authors %}
-  <tr>
-    <td>{{ a.author_name }}</td><td>{{ a.n }}</td>
-    <td>{{ '%.1f' % a.avg_conf }}</td><td>{{ a.forums }}</td>
-  </tr>
-  {% endfor %}
-</table>
-{% endif %}
-
-<h2>🕵️ 爆料情报（{{ '未读' if show == 'unread' else '全部' }} · 置信度排序）
-  <a class="mini" href="?game={{ game }}&show={{ 'all' if show == 'unread' else 'unread' }}">{{ '显示已读' if show == 'unread' else '只看未读' }}</a>
-  <a class="mini" href="#" onclick="return markAll('leak')">本区全部已读</a>
-</h2>
-{% for it in leaks %}
-<div class="card {{ 'readed' if it.read }}">
-  <div class="head">
-    <span class="badge forum">{{ it.forum_kw }}</span>
-    <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
-    <a class="ext" href="https://tieba.baidu.com/p/{{ it.tid }}" target="_blank">贴吧↗</a>
-    <span class="badge conf">conf {{ it.llm_confidence }}</span>
-    {% if it.deleted %}<span class="badge del">已删 ⚠️</span>{% endif %}
-    {% for t in it.tags %}<span class="badge tag">{{ t }}</span>{% endfor %}
-    {% if not it.read %}<button class="rd" onclick="markRead({{ it.tid }}, this)">✓ 已读</button>{% endif %}
+<div class="sec">
+  <div class="cols">
+    <div>
+      <div class="sec-title">爆料情报
+        <a class="mini" href="?game={{ game }}&show={{ 'all' if show == 'unread' else 'unread' }}">{{ '显示已读' if show == 'unread' else '只看未读' }}</a>
+        <a class="mini" href="#" onclick="return markAll('leak')">本区全部已读</a>
+      </div>
+      {% for it in leaks %}
+      {{ intel_card(it, 'leak') }}
+      {% else %}
+      <div class="empty">{{ '未读爆料清空 ✦' if show == 'unread' else '暂无确认爆料' }}</div>
+      {% endfor %}
+    </div>
+    <div>
+      <div class="sec-title">强度结论
+        <a class="mini" href="?game={{ game }}&show={{ 'all' if show == 'unread' else 'unread' }}">{{ '显示已读' if show == 'unread' else '只看未读' }}</a>
+        <a class="mini" href="#" onclick="return markAll('strength')">本区全部已读</a>
+      </div>
+      {% for it in strengths %}
+      {{ intel_card(it, 'strength') }}
+      {% else %}
+      <div class="empty">{{ '未读强度结论清空 ✦' if show == 'unread' else '暂无强度结论' }}</div>
+      {% endfor %}
+    </div>
   </div>
-  <div class="summary">{{ it.llm_summary }}</div>
-  <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}</div>
 </div>
-{% else %}
-<div class="empty">{{ '未读爆料清空了 ✨' if show == 'unread' else '暂无确认爆料' }}</div>
-{% endfor %}
 
-<h2>⚔️ 强度结论（{{ '未读' if show == 'unread' else '全部' }} · 置信度排序）
-  <a class="mini" href="?game={{ game }}&show={{ 'all' if show == 'unread' else 'unread' }}">{{ '显示已读' if show == 'unread' else '只看未读' }}</a>
-  <a class="mini" href="#" onclick="return markAll('strength')">本区全部已读</a>
-</h2>
-{% for it in strengths %}
-<div class="card {{ 'readed' if it.read }}">
-  <div class="head">
-    <span class="badge forum">{{ it.forum_kw }}</span>
-    <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
-    <a class="ext" href="https://tieba.baidu.com/p/{{ it.tid }}" target="_blank">贴吧↗</a>
-    <span class="badge conf">conf {{ it.llm_confidence }}</span>
-    {% if it.deleted %}<span class="badge del">已删 ⚠️</span>{% endif %}
-    {% for t in it.tags %}<span class="badge tag">{{ t }}</span>{% endfor %}
-    {% if not it.read %}<button class="rd" onclick="markRead({{ it.tid }}, this)">✓ 已读</button>{% endif %}
+<div class="sec">
+  <div class="cols">
+    <div>
+      <div class="sec-title">删帖监控 <span style="font-size:11px;color:var(--faint);font-family:var(--mono)">被删的帖往往说明爆料是真的</span></div>
+      {% for it in deleted %}
+      <div class="card" style="border-left-color:var(--red)">
+        <div class="head">
+          <span class="badge forum">{{ it.forum_kw }}</span>
+          <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
+          <span class="badge del">删于 {{ it.del_time }}</span>
+        </div>
+        {% if it.llm_summary %}<div class="summary">{{ it.llm_summary }}</div>{% endif %}
+        <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}（快照已留存）</div>
+      </div>
+      {% else %}
+      <div class="empty">暂无删帖记录</div>
+      {% endfor %}
+    </div>
+    <div>
+      <div class="sec-title">情报源排行</div>
+      <div class="panel">
+        {% if authors %}
+        {% set amax = authors[0].n %}
+        {% for a in authors %}
+        <div class="hbar ice">
+          <span class="lbl" title="{{ a.author_name }}">{{ a.author_name }}</span>
+          <span class="track"><span class="fill" style="width:{{ (a.n / amax * 100) | round }}%"></span></span>
+          <span class="num">{{ a.n }}</span>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="empty">暂无数据</div>
+        {% endif %}
+      </div>
+    </div>
   </div>
-  <div class="summary">{{ it.llm_summary }}</div>
-  <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}</div>
 </div>
-{% else %}
-<div class="empty">{{ '未读强度结论清空了 ✨' if show == 'unread' else '暂无强度结论' }}</div>
-{% endfor %}
 
-<h2>🗑️ 删帖监控（被删的帖往往说明爆料是真的）</h2>
-{% for it in deleted %}
-<div class="card">
-  <div class="head">
-    <span class="badge forum">{{ it.forum_kw }}</span>
-    <a class="title" href="/t/{{ it.tid }}">{{ it.title or '(无标题)' }}</a>
-    <span class="badge del">删于 {{ it.del_time }}</span>
-  </div>
-  {% if it.llm_summary %}<div class="summary">{{ it.llm_summary }}</div>{% endif %}
-  <div class="meta">{{ it.author_name or '匿名' }} · 首见 {{ it.time }}（快照已留存）</div>
+<div class="sec">
+  <div class="sec-title">扫描日志</div>
+  <table class="log">
+    <tr><th>时间</th><th>吧</th><th>看到</th><th>新帖</th><th>新楼层</th><th>状态</th></tr>
+    {% for r in logs %}
+    <tr>
+      <td>{{ r.time }}</td><td>{{ r.forum_kw or '-' }}</td>
+      <td>{{ r.threads_seen }}</td><td>{{ r.threads_new }}</td><td>{{ r.posts_new }}</td>
+      <td class="{{ 'err' if r.error else '' }}">{% if r.error %}{{ r.error }}{% else %}<span class="ok-dot">● OK</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
 </div>
-{% else %}
-<div class="empty">暂无删帖记录</div>
-{% endfor %}
 
-<h2>📋 抓取日志</h2>
-<table>
-  <tr><th>时间</th><th>吧</th><th>看到</th><th>新帖</th><th>新楼层</th><th>错误</th></tr>
-  {% for r in logs %}
-  <tr>
-    <td>{{ r.time }}</td><td>{{ r.forum_kw or '-' }}</td>
-    <td>{{ r.threads_seen }}</td><td>{{ r.threads_new }}</td><td>{{ r.posts_new }}</td>
-    <td class="err">{{ r.error or '' }}</td>
-  </tr>
-  {% endfor %}
-</table>
-
-<footer>游戏雷达 · 数据来源：百度贴吧 · LLM 判定：龙虾 (DeepSeek V4)</footer>
+<footer>GAME RADAR · SOURCE: TIEBA · JUDGE: 龙虾 (DEEPSEEK V4) · 每 5 分钟自动刷新</footer>
 
 <script>
 const GAME = "{{ game }}";
+
+// 数字滚动
+if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  document.querySelectorAll('[data-count]').forEach(el => {
+    const target = +el.dataset.count;
+    if (!target) return;
+    const t0 = performance.now(), dur = 700;
+    function tick(t) {
+      const p = Math.min((t - t0) / dur, 1), e = 1 - Math.pow(1 - p, 3);
+      el.textContent = Math.round(target * e);
+      if (p < 1) requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  });
+}
 
 async function markRead(tid, btn) {
   await fetch('/api/read/' + tid, {method: 'POST'});
@@ -365,10 +564,15 @@ function markAll(topic) {
 
 let crawlWatching = false;
 
-async function startCrawl() {
+function setCrawling(on) {
+  document.body.classList.toggle('crawling', on);
   const btn = document.getElementById('crawlbtn');
-  btn.disabled = true;
-  btn.textContent = '⏳ 抓取中…（完成后自动刷新）';
+  btn.disabled = on;
+  btn.textContent = on ? '⏳ 扫描中…（完成后自动刷新）' : '🔄 立即扫描';
+}
+
+async function startCrawl() {
+  setCrawling(true);
   await fetch('/api/crawl', {method: 'POST'});
   crawlWatching = true;
   setTimeout(pollCrawl, 5000);
@@ -379,9 +583,7 @@ async function pollCrawl() {
     const s = await (await fetch('/api/crawl/status')).json();
     if (s.running) {
       crawlWatching = true;
-      const btn = document.getElementById('crawlbtn');
-      btn.disabled = true;
-      btn.textContent = '⏳ 抓取中…（完成后自动刷新）';
+      setCrawling(true);
       setTimeout(pollCrawl, 5000);
     } else if (crawlWatching) {
       location.reload();
@@ -391,7 +593,7 @@ async function pollCrawl() {
   }
 }
 
-pollCrawl();  // 页面加载时检查是否有抓取正在跑（可能是别的标签页触发的）
+pollCrawl();  // 页面加载时检查是否有扫描正在跑（可能是别的标签页触发的）
 </script>
 </body>
 </html>"""
@@ -402,49 +604,53 @@ THREAD_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ t.title or t.tid }} - 游戏雷达</title>
+""" + FONT_LINKS + """
 <style>""" + BASE_CSS + """</style>
 </head>
 <body>
 """ + HEADER + """
 
-<h2 style="margin-top:20px">
-  {{ t.title or '(无标题)' }}
-  <a class="ext" href="https://tieba.baidu.com/p/{{ t.tid }}" target="_blank">贴吧原帖↗</a>
-</h2>
-<div class="card">
-  <div class="head">
-    <span class="badge forum">{{ t.forum_kw }}（{{ t.game }} / {{ t.topic }}）</span>
-    {% if t.deleted_at %}<span class="badge del">已删于 {{ del_time }} ⚠️</span>{% endif %}
-    <span class="badge sig">快照 {{ n_snapshots }} 份</span>
-    <span class="badge conf">已读 ✓</span>
-    <a class="mini" href="#" onclick="return unreadThis(this)">↩ 标为未读</a>
+<div class="sec">
+  <div class="sec-title">{{ t.title or '(无标题)' }}
+    <a class="ext" href="https://tieba.baidu.com/p/{{ t.tid }}" target="_blank">贴吧原帖 ↗</a>
   </div>
-  <div class="meta">楼主 {{ t.author_name or '匿名' }} · 首见 {{ first_time }} · 最近活跃 {{ last_time }}</div>
-  {% if t.llm_judged %}
-  <div style="margin-top:8px">
-    <span class="badge conf">{{ '✅ 确认情报' if t.llm_is_leak else '❌ 非情报' }} · conf {{ t.llm_confidence }}</span>
-    {% if t.llm_is_bait %}<span class="badge del">疑似钓鱼/引战</span>{% endif %}
-    {% for tag in tags %}<span class="badge tag">{{ tag }}</span>{% endfor %}
+  <div class="card {{ t.topic }}">
+    <div class="head">
+      <span class="badge forum">{{ t.forum_kw }}（{{ t.game }} / {{ t.topic }}）</span>
+      {% if t.deleted_at %}<span class="badge del">已删于 {{ del_time }} ⚠</span>{% endif %}
+      <span class="badge sig">快照 {{ n_snapshots }} 份</span>
+      <span class="badge ok">已读 ✓</span>
+      <a class="mini" href="#" onclick="return unreadThis(this)">↩ 标为未读</a>
+    </div>
+    <div class="meta">楼主 {{ t.author_name or '匿名' }} · 首见 {{ first_time }} · 最近活跃 {{ last_time }}</div>
+    {% if t.llm_judged %}
+    <div style="margin-top:8px">
+      <span class="badge {{ 'ok' if t.llm_is_leak else 'forum' }}">{{ '✅ 确认情报' if t.llm_is_leak else '❌ 非情报' }} · conf {{ t.llm_confidence }}</span>
+      {% if t.llm_is_bait %}<span class="badge del">疑似钓鱼/引战</span>{% endif %}
+      {% for tag in tags %}<span class="badge tag">{{ tag }}</span>{% endfor %}
+    </div>
+    <div class="summary" style="margin-top:6px">{{ t.llm_summary }}</div>
+    {% else %}
+    <div class="meta" style="margin-top:8px">⏳ 尚未 LLM 判定</div>
+    {% endif %}
   </div>
-  <div class="summary" style="margin-top:6px">{{ t.llm_summary }}</div>
-  {% else %}
-  <div class="meta" style="margin-top:8px">⏳ 尚未 LLM 判定</div>
-  {% endif %}
 </div>
 
-<h2>💬 楼层（{{ posts|length }} 条 · 👑=楼主 · ⭐=预筛命中 · LLM 只判楼主楼层）</h2>
-{% for p in posts %}
-<div class="floor {{ 'sig' if p.is_op }}">
-  <div class="who">
-    {{ p.floor }}楼 · {{ p.author_name or '匿名' }} · {{ p.time }}
-    {% if p.is_op %}<span class="badge sig">👑 楼主</span>{% endif %}
-    {% if p.is_signal %}<span class="badge tag">⭐ {{ p.signal_reason }}</span>{% endif %}
+<div class="sec">
+  <div class="sec-title">楼层记录 <span style="font-size:11px;color:var(--faint);font-family:var(--mono)">{{ posts|length }} 条 · 👑=楼主 · ⭐=预筛命中 · LLM 只判楼主楼层</span></div>
+  {% for p in posts %}
+  <div class="floor {{ 'sig' if p.is_op }}">
+    <div class="who">
+      #{{ p.floor }} · {{ p.author_name or '匿名' }} · {{ p.time }}
+      {% if p.is_op %}<span class="badge ok">👑 楼主</span>{% endif %}
+      {% if p.is_signal %}<span class="badge sig">⭐ {{ p.signal_reason }}</span>{% endif %}
+    </div>
+    <div class="txt">{{ p.content or '(空)' }}</div>
   </div>
-  <div class="txt">{{ p.content or '(空)' }}</div>
+  {% else %}
+  <div class="empty">尚未抓到楼层内容</div>
+  {% endfor %}
 </div>
-{% else %}
-<div class="empty">尚未抓到楼层内容</div>
-{% endfor %}
 
 <footer><a class="ext" href="/">← 返回总览</a></footer>
 
@@ -464,31 +670,36 @@ SEARCH_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>搜索：{{ q }} - 游戏雷达</title>
+""" + FONT_LINKS + """
 <style>""" + BASE_CSS + """</style>
 </head>
 <body>
 """ + HEADER + """
 
-<h2>🔍 「{{ q }}」命中 {{ results|length }} 条楼层</h2>
-{% for r in results %}
-<div class="card">
-  <div class="head">
-    <span class="badge forum">{{ r.forum_kw }}</span>
-    <a class="title" href="/t/{{ r.tid }}">{{ r.title or '(无标题)' }}</a>
-    <span class="badge sig">{{ r.floor }}楼</span>
-    {% if r.is_signal %}<span class="badge sig">⭐</span>{% endif %}
+<div class="sec">
+  <div class="sec-title">检索「{{ q }}」 <span style="font-size:11px;color:var(--faint);font-family:var(--mono)">命中 {{ results|length }} 条楼层</span></div>
+  {% for r in results %}
+  <div class="card">
+    <div class="head">
+      <span class="badge forum">{{ r.forum_kw }}</span>
+      <a class="title" href="/t/{{ r.tid }}">{{ r.title or '(无标题)' }}</a>
+      <span class="badge sig">#{{ r.floor }}</span>
+      {% if r.is_signal %}<span class="badge ok">⭐</span>{% endif %}
+    </div>
+    <div class="summary">{{ r.excerpt }}</div>
+    <div class="meta">{{ r.author_name or '匿名' }} · {{ r.time }}</div>
   </div>
-  <div class="summary">{{ r.excerpt }}</div>
-  <div class="meta">{{ r.author_name or '匿名' }} · {{ r.time }}</div>
+  {% else %}
+  <div class="empty">没有命中 ✦ 换个关键词试试</div>
+  {% endfor %}
 </div>
-{% else %}
-<div class="empty">没有命中。换个关键词试试？</div>
-{% endfor %}
 
 <footer><a class="ext" href="/">← 返回总览</a></footer>
 </body>
 </html>"""
 
+
+# ─────────────────────────── 数据 / 图表 ───────────────────────────
 
 def _trend(conn, game: str) -> list[dict]:
     """近 14 天每日新帖数和确认情报数（北京时间分桶）。"""
@@ -504,18 +715,77 @@ def _trend(conn, game: str) -> list[dict]:
     by_day = {r["day"]: (r["total"], r["hits"] or 0) for r in rows}
     today = datetime.now(TZ_CN).date()
     days = [(today - timedelta(days=i)) for i in range(13, -1, -1)]
-    max_total = max((by_day.get(d.isoformat(), (0, 0))[0] for d in days), default=0) or 1
     out = []
     for d in days:
         total, hits = by_day.get(d.isoformat(), (0, 0))
-        out.append({
-            "label": d.strftime("%m-%d"),
-            "total": total,
-            "h": round(total / max_total * 100) if total else 2,
-            "hit_pct": round(hits / total * 100) if total else 0,
-        })
+        out.append({"label": d.strftime("%m-%d"), "total": total, "hits": hits})
     return out
 
+
+def _trend_svg(trend: list[dict]) -> str:
+    """把 14 天趋势渲染成内联 SVG 面积图：总量面积 + 命中柱 + 悬浮提示。"""
+    W, H = 720, 200
+    pl, pr, pt, pb = 34, 10, 14, 26
+    pw, ph = W - pl - pr, H - pt - pb
+    mx = max((d["total"] for d in trend), default=0) or 1
+    n = max(len(trend), 1)
+    step = pw / max(n - 1, 1)
+
+    pts = []
+    for i, d in enumerate(trend):
+        x = pl + i * step
+        y = pt + ph * (1 - d["total"] / mx)
+        pts.append((x, y, d))
+
+    line = " ".join(f"{'M' if i == 0 else 'L'}{x:.1f},{y:.1f}" for i, (x, y, _) in enumerate(pts))
+    base = pt + ph
+    area = f"{line} L{pts[-1][0]:.1f},{base} L{pts[0][0]:.1f},{base} Z"
+
+    s = [f'<svg class="chart-svg" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" role="img">']
+    s.append(
+        '<defs><linearGradient id="ag" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#2ee59d" stop-opacity=".28"/>'
+        '<stop offset="1" stop-color="#2ee59d" stop-opacity=".02"/></linearGradient></defs>'
+    )
+    # 水平网格 + Y 轴刻度
+    for frac in (0.0, 0.5, 1.0):
+        gy = pt + ph * (1 - frac)
+        val = round(mx * frac)
+        s.append(f'<line x1="{pl}" y1="{gy:.1f}" x2="{W - pr}" y2="{gy:.1f}" '
+                 f'stroke="#1c2830" stroke-width="1" stroke-dasharray="3 4"/>')
+        s.append(f'<text x="{pl - 6}" y="{gy + 3.5:.1f}" text-anchor="end" '
+                 f'font-size="10" fill="#45565e" font-family="Consolas,monospace">{val}</text>')
+    # 命中柱（在面积图下层）
+    bw = min(14.0, step * 0.4)
+    for x, _, d in pts:
+        if d["hits"]:
+            bh = ph * d["hits"] / mx
+            s.append(f'<rect x="{x - bw / 2:.1f}" y="{base - bh:.1f}" width="{bw:.1f}" height="{bh:.1f}" '
+                     f'fill="#ffb648" opacity=".75" rx="1.5"/>')
+    # 总量面积 + 折线
+    s.append(f'<path d="{area}" fill="url(#ag)"/>')
+    s.append(f'<path d="{line}" fill="none" stroke="#2ee59d" stroke-width="1.6" '
+             f'stroke-linejoin="round" stroke-linecap="round"/>')
+    # 数据点（带原生悬浮提示）
+    for i, (x, y, d) in enumerate(pts):
+        last = i == len(pts) - 1
+        r = 3.4 if last else 2.4
+        s.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r}" fill="#0b1014" '
+                 f'stroke="#2ee59d" stroke-width="1.4">'
+                 f'<title>{d["label"]}：新帖 {d["total"]} · 确认情报 {d["hits"]}</title></circle>')
+        if last:
+            s.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7" fill="none" stroke="#2ee59d" '
+                     f'stroke-width="1" opacity=".4"/>')
+    # X 轴标签（隔天）
+    for i, (x, _, d) in enumerate(pts):
+        if i % 2 == (len(pts) - 1) % 2:
+            s.append(f'<text x="{x:.1f}" y="{H - 8}" text-anchor="middle" font-size="10" '
+                     f'fill="#45565e" font-family="Consolas,monospace">{d["label"]}</text>')
+    s.append("</svg>")
+    return "".join(s)
+
+
+# ─────────────────────────── 路由 ───────────────────────────
 
 @app.route("/")
 def index():
@@ -596,6 +866,28 @@ def index():
             GROUP BY t.author_name ORDER BY n DESC, avg_conf DESC LIMIT 8
         """, params).fetchall()]
 
+        # 情报源矩阵：每个吧的 确认情报/总帖 数
+        forum_matrix = [dict(r) for r in conn.execute("""
+            SELECT f.name, f.game, COALESCE(f.topic, 'leak') AS topic,
+                   COUNT(t.tid) AS n_threads,
+                   COALESCE(SUM(CASE WHEN t.llm_is_leak = 1 THEN 1 ELSE 0 END), 0) AS n_intel
+            FROM forums f LEFT JOIN threads t ON t.forum_kw = f.kw
+            GROUP BY f.kw ORDER BY n_intel DESC
+        """).fetchall()]
+        fmax = max((f["n_intel"] for f in forum_matrix), default=0) or 1
+        for f in forum_matrix:
+            f["pct"] = round(f["n_intel"] / fmax * 100)
+
+        # 游戏占比（确认情报数）
+        game_split = [dict(r) for r in conn.execute("""
+            SELECT f.game, COALESCE(SUM(CASE WHEN t.llm_is_leak = 1 THEN 1 ELSE 0 END), 0) AS n
+            FROM forums f LEFT JOIN threads t ON t.forum_kw = f.kw
+            GROUP BY f.game ORDER BY f.game
+        """).fetchall()]
+        gtotal = sum(g["n"] for g in game_split) or 1
+        for g in game_split:
+            g["pct"] = max(round(g["n"] / gtotal * 100), 8)
+
         logs = [
             {**dict(r), "time": _fmt_time(r["started_at"])}
             for r in conn.execute(
@@ -627,15 +919,16 @@ def index():
                 "SELECT MAX(ended_at) FROM crawl_log").fetchone()[0]),
         }
 
-        trend = _trend(conn, game)
+        chart_svg = _trend_svg(_trend(conn, game))
     finally:
         conn.close()
 
     return render_template_string(
         INDEX_TEMPLATE, stats=stats, leaks=leaks, strengths=strengths,
         deleted=deleted, logs=logs, games=games, game=game, show=show, focus=focus,
-        trend=trend, tag_stats=tag_stats, authors=authors,
-        subtitle="贴吧内鬼爆料 · 强度分析 · 每 5 分钟自动刷新", q="")
+        chart_svg=chart_svg, tag_stats=tag_stats, authors=authors,
+        forum_matrix=forum_matrix, game_split=game_split,
+        subtitle="贴吧内鬼爆料 · 强度分析", q="")
 
 
 @app.route("/t/<int:tid>")
@@ -698,6 +991,8 @@ def search():
     return render_template_string(
         SEARCH_TEMPLATE, q=q, results=results, subtitle="全文搜索")
 
+
+# ─────────────────────────── API ───────────────────────────
 
 @app.route("/api/read/<int:tid>", methods=["POST"])
 def api_read(tid: int):
